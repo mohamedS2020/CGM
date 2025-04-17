@@ -1,0 +1,50 @@
+{
+  "expo": {
+    "name": "CGM",
+    "slug": "CGM",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "plugins": [
+      [
+        "react-native-nfc-manager",
+        {
+          "isProvideEnable": true
+        }
+      ]
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.yourcompany.cgm",
+      "infoPlist": {
+        "NFCReaderUsageDescription": "This app uses NFC to scan glucose monitoring sensors",
+        "com.apple.developer.nfc.readersession.iso15693.app": true
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      },
+      "package": "com.yourcompany.cgm",
+      "permissions": [
+        "android.permission.NFC"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "fe08b34e-67a0-43d6-b1a4-4c663fe66448"
+      }
+    }
+  }
+}

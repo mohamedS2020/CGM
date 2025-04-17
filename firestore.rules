@@ -1,0 +1,23 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Allow users to read and write their own data
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+      
+      // Allow access to subcollections
+      match /measurements/{measurementId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+      
+      match /notes/{noteId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+    }
+    
+    // Read-only access to shared resources
+    match /sharedResources/{resourceId} {
+      allow read: if request.auth != null;
+    }
+  }
+}
