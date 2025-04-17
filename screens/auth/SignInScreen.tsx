@@ -10,6 +10,8 @@ import {
   Alert,
   ActivityIndicator,
   Image,
+  Modal,
+  Animated,
 } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -28,7 +30,10 @@ const SignInScreen = () => {
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [errors, setErrors] = useState<{[key: string]: string}>({});
+  const [authError, setAuthError] = useState<string>('');
   const [showPassword, setShowPassword] = useState(false);
+  const [showErrorModal, setShowErrorModal] = useState(false);
+  const fadeAnim = useState(new Animated.Value(0))[0];
   
   const navigation = useNavigation<SignInScreenNavigationProp>();
   const { login } = useAuth();
@@ -40,6 +45,7 @@ const SignInScreen = () => {
   
   const validateForm = () => {
     const newErrors: {[key: string]: string} = {};
+    setAuthError('');
     
     if (!email.trim()) {
       newErrors.email = 'Email is required';
@@ -76,17 +82,21 @@ const SignInScreen = () => {
         errorMessage = 'Please enter a valid email address.';
       } else if (error.code === 'auth/user-disabled') {
         errorMessage = 'This account has been disabled.';
-      } else if (error.code === 'auth/user-not-found') {
-        errorMessage = 'No account found with this email.';
-      } else if (error.code === 'auth/wrong-password') {
-        errorMessage = 'Incorrect password. Please try again.';
+      } else if (error.code === 'auth/user-not-found' || error.code === 'auth/invalid-credential' || error.code === 'auth/wrong-password') {
+        errorMessage = 'Email or Password is incorrect.';
       } else if (error.code === 'auth/too-many-requests') {
         errorMessage = 'Too many failed login attempts. Please try again later.';
       } else if (error.message) {
         errorMessage = error.message;
       }
       
-      Alert.alert('Login Error', errorMessage);
+      setAuthError(errorMessage);
+      setShowErrorModal(true);
+      Animated.timing(fadeAnim, {
+        toValue: 1,
+        duration: 300,
+        useNativeDriver: true,
+      }).start();
     } finally {
       setLoading(false);
     }
@@ -173,6 +183,34 @@ const SignInScreen = () => {
           <Text style={styles.forgotPasswordText}>Forgot password?</Text>
         </TouchableOpacity>
         
+        <Modal
+          visible={showErrorModal}
+          transparent={true}
+          animationType="fade"
+          onRequestClose={() => setShowErrorModal(false)}
+        >
+          <TouchableOpacity 
+            style={styles.modalOverlay}
+            activeOpacity={1}
+            onPress={() => setShowErrorModal(false)}
+          >
+            <Animated.View 
+              style={[styles.modalContent, { opacity: fadeAnim }]}
+            >
+              <View style={styles.modalHeader}>
+              </View>
+              <Text style={styles.modalTitle}>Wrong credentials</Text>
+              <Text style={styles.modalMessage}>{authError}</Text>
+              <TouchableOpacity
+                style={styles.modalButton}
+                onPress={() => setShowErrorModal(false)}
+              >
+                <Text style={styles.modalButtonText}>Try Again</Text>
+              </TouchableOpacity>
+            </Animated.View>
+          </TouchableOpacity>
+        </Modal>
+
         <TouchableOpacity 
           style={[styles.button, loading && styles.buttonDisabled]}
           onPress={handleSignIn}
@@ -197,6 +235,64 @@ const SignInScreen = () => {
 };
 
 const styles = StyleSheet.create({
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.4)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalContent: {
+    backgroundColor: 'white',
+    borderRadius: 20,
+    padding: 20,
+    width: '80%',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: {
+      width: 0,
+      height: 2,
+    },
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+    elevation: 5,
+  },
+  modalHeader: {
+    marginBottom: 15,
+  },
+  modalTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#333',
+    marginBottom: 10,
+    textAlign: 'center',
+  },
+  modalMessage: {
+    fontSize: 16,
+    color: '#666',
+    marginBottom: 20,
+    textAlign: 'center',
+    lineHeight: 22,
+  },
+  modalButton: {
+    backgroundColor: '#4361EE',
+    paddingVertical: 12,
+    paddingHorizontal: 30,
+    borderRadius: 8,
+    width: '100%',
+  },
+  modalButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
+    textAlign: 'center',
+  },
+  authErrorText: {
+    color: '#ff3b30',
+    fontSize: 14,
+    textAlign: 'center',
+    marginBottom: 15,
+    paddingHorizontal: 20,
+  },
   container: {
     flex: 1,
     backgroundColor: '#f8f9fa',
@@ -315,4 +411,4 @@ const styles = StyleSheet.create({
   },
 });
 
-export default SignInScreen; 
+export default SignInScreen;
