@@ -26,8 +26,9 @@ const EmailVerificationScreen = () => {
   const [canResend, setCanResend] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [checking, setChecking] = useState(false);
-  const [timeoutId, setTimeoutId] = useState<NodeJS.Timeout | null>(null);
-
+  const [timeoutId, setTimeoutId] = useState<ReturnType<typeof setTimeout> | null>(null);
+  // Ensure the correct type for setTimeout is used
+  type Timeout = ReturnType<typeof setTimeout>;
   // Start countdown for resend button
   useEffect(() => {
     if (countdown > 0 && !canResend) {
