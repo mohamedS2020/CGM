@@ -16,13 +16,16 @@ import {
 } from 'react-native';
 import { useAuth } from '../../context/AuthContext';
 import { db } from '../../firebase/firebaseconfig';
-import { collection, addDoc, serverTimestamp, getDocs, query, orderBy, limit, deleteDoc, doc } from 'firebase/firestore';
+import { collection, addDoc, serverTimestamp, getDocs, query, orderBy, limit, deleteDoc, doc, updateDoc, setDoc } from 'firebase/firestore';
 import NfcManager from 'react-native-nfc-manager';
 import { useNavigation } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
-import SensorNfcService, { NfcErrorType } from '../../services/SensorNfcService';
+import SensorNfcService, { NfcErrorType, ISensorInfo } from '../../services/SensorNfcService';
 import { NfcTech } from 'react-native-nfc-manager';
 import NfcService from '../../services/NfcService';
+import { SensorStatusService } from '../../services/SensorStatusService';
+import GlucoseCalculationService from '../../services/GlucoseCalculationService';
+import NfcScanGuide from '../../components/NfcScanGuide';
 
 // Initialize NFC Manager
 try {
@@ -41,18 +44,26 @@ interface Sensor {
   manufacturer: string;
   model: string;
   status: 'active' | 'expired' | 'removed';
+  batteryLevel?: number | null;
+  lastReading?: number | null;
+  lastReadingTime?: Date | null;
 }
 
 const StartSensorScreen = () => {
   const { user } = useAuth();
   const navigation = useNavigation();
   const nfcService = SensorNfcService.getInstance();
+  const sensorStatusService = SensorStatusService;
+  const glucoseService = GlucoseCalculationService.getInstance();
   
   const [scanning, setScanning] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [currentSensor, setCurrentSensor] = useState<Sensor | null>(null);
   const [loading, setLoading] = useState(true);
   const [nfcAvailable, setNfcAvailable] = useState<boolean | null>(null);
+  const [verifyingSensor, setVerifyingSensor] = useState(false);
+  const [sensorTestResult, setSensorTestResult] = useState<{success: boolean, reading: number | null, error?: string} | null>(null);
+  const [showScanGuide, setShowScanGuide] = useState(false);
   
   // Add a ref to track if an NFC operation is in progress
   const nfcOperationInProgress = useRef(false);
@@ -90,7 +101,10 @@ const StartSensorScreen = () => {
               expiresAt: data.expiresAt.toDate(),
               manufacturer: data.manufacturer,
               model: data.model,
-              status: data.status
+              status: data.status,
+              batteryLevel: data.batteryLevel,
+              lastReading: data.lastReading,
+              lastReadingTime: data.lastReadingTime?.toDate(),
             });
             console.log(`[StartSensorScreen] Set active sensor with serial: ${data.serialNumber}`);
           } else {
@@ -387,125 +401,257 @@ const StartSensorScreen = () => {
         nfcOperationInProgress.current = false;
       };
       
-      // Prompt user to scan sensor
-      Alert.alert(
-        'Ready to Scan',
-        'Hold your phone near the new sensor to activate it.',
-        [
-          { 
-            text: 'Cancel', 
-            style: 'cancel', 
-            onPress: async () => {
-              console.log('[StartSensorScreen] Scan cancelled by user');
-              setScanning(false);
-              await ensureNfcCleanup();
-            }
-          },
-          { 
-            text: 'Scan',
-            onPress: async () => {
-              console.log('[StartSensorScreen] User confirmed scan, starting NFC scan');
-              try {
-                // Check if NfcManager exists before attempting to use it
-                if (typeof NfcManager === 'undefined' || NfcManager === null) {
-                  console.error('[StartSensorScreen] NFC Manager is not available');
-                  throw new Error(NfcErrorType.NOT_SUPPORTED);
-                }
+      // Show the NFC scan guide
+      setShowScanGuide(true);
+      
+      // Start the NFC scan directly without a confirmation dialog
+      try {
+        // Check if NfcManager exists before attempting to use it
+        if (typeof NfcManager === 'undefined' || NfcManager === null) {
+          console.error('[StartSensorScreen] NFC Manager is not available');
+          throw new Error(NfcErrorType.NOT_SUPPORTED);
+        }
 
-                console.log('[StartSensorScreen] Requesting NFC V technology');
-                // 1. Request NFC technology
-                await NfcManager.requestTechnology(NfcTech.NfcV);
-                
-                console.log('[StartSensorScreen] NFC technology granted, getting tag');
-                // 2. Read tag information
-                const tag = await NfcManager.getTag();
-                console.log('[StartSensorScreen] Retrieved tag information:', tag);
-                
-                if (!tag || !tag.id) {
-                  console.error('[StartSensorScreen] No tag ID found in scanned tag');
-                  throw new Error(NfcErrorType.TAG_NOT_FOUND);
-                }
-                
-                // 3. Extract serial number from tag ID
-                const serialNumber = tag.id;
-                console.log(`[StartSensorScreen] Extracted serial number: ${serialNumber}`);
-                
-                // 4. Extract manufacturer data if available
-                // Note: tag.manufacturer may not exist on all tag types
-                const manufacturer = 'Texas Instruments'; // Default value
-                const model = 'RF430FRL15xH CGM Sensor';
-                
-                // Show confirmation with the real serial number
-                Alert.alert(
-                  'Sensor Found',
-                  `Found sensor with serial number: ${serialNumber}. Do you want to activate this sensor?`,
-                  [
-                    {
-                      text: 'Cancel',
-                      style: 'cancel',
-                      onPress: async () => {
-                        console.log('[StartSensorScreen] User cancelled sensor activation');
-                        setScanning(false);
-                        await ensureNfcCleanup();
-                      }
-                    },
-                    {
-                      text: 'Activate',
-                      onPress: async () => {
-                        console.log('[StartSensorScreen] User confirmed sensor activation');
-                        // Clean up NFC before activating sensor
-                        await ensureNfcCleanup();
-                        activateSensor(serialNumber, manufacturer, model);
-                      }
-                    }
-                  ]
-                );
-              } catch (error) {
-                console.error('[StartSensorScreen] Error during NFC scan:', error);
-                
-                let errorMessage = 'An error occurred while scanning the sensor.';
-                
-                // Handle specific error types
-                if (error instanceof Error) {
-                  const errorString = error.toString();
-                  if (errorString.includes(NfcErrorType.CANCELLED)) {
-                    errorMessage = 'Scan was cancelled.';
-                    console.log('[StartSensorScreen] Scan was cancelled by user or timeout');
-                  } else if (errorString.includes(NfcErrorType.NOT_SUPPORTED)) {
-                    errorMessage = 'NFC is not supported on this device.';
-                    console.error('[StartSensorScreen] NFC is not supported on this device');
-                  } else if (errorString.includes(NfcErrorType.NOT_ENABLED)) {
-                    errorMessage = 'NFC is not enabled. Please enable NFC in your device settings.';
-                    console.error('[StartSensorScreen] NFC is not enabled on this device');
-                  } else if (errorString.includes(NfcErrorType.TAG_NOT_FOUND)) {
-                    errorMessage = 'No sensor found. Please try again and make sure the sensor is within range.';
-                    console.error('[StartSensorScreen] No tag found during scan');
-                  } else if (errorString.includes('one request at a time')) {
-                    errorMessage = 'Another NFC operation is in progress. Please wait a moment and try again.';
-                    console.error('[StartSensorScreen] Concurrent NFC request detected');
-                  } else {
-                    console.error('[StartSensorScreen] Unknown error during scan:', error);
+        console.log('[StartSensorScreen] Requesting NFC V technology');
+        // 1. Request NFC technology
+        await NfcManager.requestTechnology(NfcTech.NfcV);
+        
+        // Hide the scan guide when we detect a tag
+        setShowScanGuide(false);
+        
+        console.log('[StartSensorScreen] NFC technology granted, getting tag');
+        // 2. Read tag information and sensor info
+        const tag = await NfcManager.getTag();
+        console.log('[StartSensorScreen] Retrieved tag information:', tag);
+        
+        if (!tag || !tag.id) {
+          console.error('[StartSensorScreen] No tag ID found in scanned tag');
+          throw new Error(NfcErrorType.TAG_NOT_FOUND);
+        }
+        
+        // 3. Get detailed sensor information
+        const sensorInfo = await nfcService.readSensorInfo();
+        if (!sensorInfo) {
+          console.error('[StartSensorScreen] Failed to read sensor information');
+          throw new Error(NfcErrorType.COMMUNICATION_ERROR);
+        }
+        
+        // 4. Extract serial number from sensor info
+        const serialNumber = sensorInfo.uid || tag.id;
+        console.log(`[StartSensorScreen] Extracted serial number: ${serialNumber}`);
+        
+        // 5. Extract manufacturer data if available
+        const manufacturer = sensorInfo.manufacturerData ? 
+          'Texas Instruments' : 'Texas Instruments'; // Default if not available
+        const model = 'RF430FRL15xH CGM Sensor';
+        
+        // 6. Verify the sensor before activation
+        setVerifyingSensor(true);
+        await ensureNfcCleanup(); // Cleanup before testing
+        
+        // Show verification message
+        Alert.alert(
+          'Sensor Found',
+          `Found sensor with serial number: ${serialNumber}. Verifying sensor functionality...`,
+          [{ text: 'OK' }]
+        );
+        
+        // Perform a test reading to verify the sensor works
+        try {
+          // Try to read from the sensor
+          const adcValue = await nfcService.safeReadGlucoseSensor();
+          
+          if (adcValue > 0) {
+            // Convert to glucose
+            const glucoseValue = glucoseService.adcToGlucose(adcValue);
+            
+            setSensorTestResult({
+              success: true,
+              reading: glucoseValue
+            });
+            
+            // Show confirmation with the real serial number and test reading
+            Alert.alert(
+              'Sensor Verified',
+              `Found sensor with serial number: ${serialNumber}.\n\nTest reading: ${glucoseValue} mg/dL.\n\nDo you want to activate this sensor?`,
+              [
+                {
+                  text: 'Cancel',
+                  style: 'cancel',
+                  onPress: async () => {
+                    console.log('[StartSensorScreen] User cancelled sensor activation');
+                    setScanning(false);
+                    setVerifyingSensor(false);
+                    setSensorTestResult(null);
+                    await ensureNfcCleanup();
                   }
-                } else {
-                  console.error('[StartSensorScreen] Non-Error object thrown during scan:', error);
+                },
+                {
+                  text: 'Activate',
+                  onPress: async () => {
+                    console.log('[StartSensorScreen] User confirmed sensor activation');
+                    setVerifyingSensor(false);
+                    // Clean up NFC before activating sensor
+                    await ensureNfcCleanup();
+                    activateSensor(serialNumber, manufacturer, model);
+                  }
                 }
-                
-                Alert.alert('Scan Failed', errorMessage);
-                setScanning(false);
-              } finally {
-                // Clean up NFC resources
-                await ensureNfcCleanup();
-              }
-            }
+              ]
+            );
+          } else {
+            // Sensor reading failed
+            setSensorTestResult({
+              success: false,
+              reading: null,
+              error: 'Sensor did not provide a valid reading'
+            });
+            
+            Alert.alert(
+              'Sensor Verification Failed',
+              'The sensor was detected but did not provide a valid reading. Do you want to try again or activate anyway?',
+              [
+                {
+                  text: 'Cancel',
+                  style: 'cancel',
+                  onPress: async () => {
+                    console.log('[StartSensorScreen] User cancelled sensor activation after failed test');
+                    setScanning(false);
+                    setVerifyingSensor(false);
+                    setSensorTestResult(null);
+                    await ensureNfcCleanup();
+                  }
+                },
+                {
+                  text: 'Try Again',
+                  onPress: async () => {
+                    console.log('[StartSensorScreen] User wants to try reading again');
+                    setVerifyingSensor(false);
+                    setSensorTestResult(null);
+                    await ensureNfcCleanup();
+                    // Call handleScan again
+                    handleScan();
+                  }
+                },
+                {
+                  text: 'Activate Anyway',
+                  onPress: async () => {
+                    console.log('[StartSensorScreen] User activating sensor despite failed test');
+                    setVerifyingSensor(false);
+                    // Clean up NFC before activating sensor
+                    await ensureNfcCleanup();
+                    activateSensor(serialNumber, manufacturer, model);
+                  }
+                }
+              ]
+            );
           }
-        ]
-      );
+        } catch (testError) {
+          console.error('[StartSensorScreen] Error testing sensor:', testError);
+          setSensorTestResult({
+            success: false,
+            reading: null,
+            error: testError instanceof Error ? testError.message : 'Unknown error testing sensor'
+          });
+          
+          Alert.alert(
+            'Sensor Test Failed',
+            'There was an error testing the sensor. Do you want to try again or activate anyway?',
+            [
+              {
+                text: 'Cancel',
+                style: 'cancel',
+                onPress: async () => {
+                  console.log('[StartSensorScreen] User cancelled after test error');
+                  setScanning(false);
+                  setVerifyingSensor(false);
+                  setSensorTestResult(null);
+                  await ensureNfcCleanup();
+                }
+              },
+              {
+                text: 'Try Again',
+                onPress: async () => {
+                  console.log('[StartSensorScreen] User wants to try scanning again after error');
+                  setVerifyingSensor(false);
+                  setSensorTestResult(null);
+                  await ensureNfcCleanup();
+                  // Call handleScan again
+                  handleScan();
+                }
+              },
+              {
+                text: 'Activate Anyway',
+                onPress: async () => {
+                  console.log('[StartSensorScreen] User activating despite test error');
+                  setVerifyingSensor(false);
+                  // Clean up NFC before activating sensor
+                  await ensureNfcCleanup();
+                  activateSensor(serialNumber, manufacturer, model);
+                }
+              }
+            ]
+          );
+        }
+      } catch (error) {
+        // Hide the scan guide when there's an error
+        setShowScanGuide(false);
+        
+        console.error('[StartSensorScreen] Error during NFC scan:', error);
+        
+        let errorMessage = 'An error occurred while scanning the sensor.';
+        
+        // Handle specific error types
+        if (error instanceof Error) {
+          const errorString = error.toString();
+          if (errorString.includes(NfcErrorType.CANCELLED)) {
+            errorMessage = 'Scan was cancelled.';
+            console.log('[StartSensorScreen] Scan was cancelled by user or timeout');
+          } else if (errorString.includes(NfcErrorType.NOT_SUPPORTED)) {
+            errorMessage = 'NFC is not supported on this device.';
+            console.error('[StartSensorScreen] NFC is not supported on this device');
+          } else if (errorString.includes(NfcErrorType.NOT_ENABLED)) {
+            errorMessage = 'NFC is not enabled. Please enable NFC in your device settings.';
+            console.error('[StartSensorScreen] NFC is not enabled on this device');
+          } else if (errorString.includes(NfcErrorType.TAG_NOT_FOUND)) {
+            errorMessage = 'No sensor found. Please try again and make sure the sensor is within range.';
+            console.error('[StartSensorScreen] No tag found during scan');
+          } else if (errorString.includes('one request at a time')) {
+            errorMessage = 'Another NFC operation is in progress. Please wait a moment and try again.';
+            console.error('[StartSensorScreen] Concurrent NFC request detected');
+          } else {
+            console.error('[StartSensorScreen] Unknown error during scan:', error);
+          }
+        } else {
+          console.error('[StartSensorScreen] Non-Error object thrown during scan:', error);
+        }
+        
+        Alert.alert('Scan Failed', errorMessage);
+        setScanning(false);
+        setVerifyingSensor(false);
+      } finally {
+        // Clean up NFC resources
+        await ensureNfcCleanup();
+      }
     } catch (error) {
+      setShowScanGuide(false);
       console.error('[StartSensorScreen] Unexpected error during scan initialization:', error);
       Alert.alert('Error', 'Failed to initialize sensor scan.');
       setScanning(false);
+      setVerifyingSensor(false);
       await ensureNfcCleanup();
     }
+  };
+  
+  // Handle scan guide timeout
+  const handleScanTimeout = () => {
+    setShowScanGuide(false);
+    Alert.alert(
+      'Scan Timeout',
+      'Unable to detect a sensor. Make sure your sensor is within range and try again.',
+      [{ text: 'OK' }]
+    );
+    ensureNfcCleanup();
+    setScanning(false);
   };
   
   // Activate a new sensor
@@ -534,10 +680,32 @@ const StartSensorScreen = () => {
         manufacturer,
         model,
         status: 'active',
-        createdAt: serverTimestamp()
+        createdAt: serverTimestamp(),
+        lastReading: sensorTestResult?.reading || null,
+        lastReadingTime: sensorTestResult?.success ? now : null,
+        batteryLevel: 100, // Assume full battery for new sensor
       };
       
       const docRef = await addDoc(sensorsRef, newSensor);
+      
+      // Also store sensor information in the main sensors collection
+      const mainSensorRef = doc(db, 'sensors', serialNumber);
+      await setDoc(mainSensorRef, {
+        serialNumber,
+        userId: user.uid,
+        activationDate: now,
+        expirationDate: expiresAt,
+        manufacturer,
+        model,
+        status: 'active',
+        lastScanTime: now,
+        batteryLevel: 100,
+        lastReading: sensorTestResult?.reading || null,
+        lastReadingTime: sensorTestResult?.success ? now : null,
+        isExpired: false,
+        isExpiringSoon: false,
+        hasLowBattery: false,
+      });
       
       // Update state
       setCurrentSensor({
@@ -547,8 +715,14 @@ const StartSensorScreen = () => {
         expiresAt,
         manufacturer,
         model,
-        status: 'active'
+        status: 'active',
+        lastReading: sensorTestResult?.reading || null,
+        lastReadingTime: sensorTestResult?.success ? now : null,
+        batteryLevel: 100,
       });
+      
+      // Update sensor status service
+      await sensorStatusService.activateSensor(serialNumber, user.uid);
       
       // Success notification
       Alert.alert(
@@ -577,11 +751,24 @@ const StartSensorScreen = () => {
     if (!user || !currentSensor?.id) return;
     
     try {
-      // Use doc() to get a document reference for the sensor
+      // Update the sensor document in Firestore to mark as removed
       const sensorDocRef = doc(db, 'users', user.uid, 'sensors', currentSensor.id);
       
-      // Delete the document
-      await deleteDoc(sensorDocRef);
+      // Update instead of delete to keep the history
+      await updateDoc(sensorDocRef, {
+        status: 'removed',
+        removedAt: new Date(),
+      });
+      
+      // Also update the main sensors collection
+      if (currentSensor.serialNumber) {
+        const mainSensorRef = doc(db, 'sensors', currentSensor.serialNumber);
+        await updateDoc(mainSensorRef, {
+          status: 'removed',
+          isConnected: false,
+          removedAt: new Date(),
+        });
+      }
       
       // Clear current sensor state
       setCurrentSensor(null);
@@ -688,32 +875,34 @@ const StartSensorScreen = () => {
           )}
         </View>
         
-        {/* Scan Instructions */}
-        <View style={styles.sectionContainer}>
-          <Text style={styles.sectionTitle}>Start New Sensor</Text>
-          
-          <View style={styles.instructionsContainer}>
-            <Text style={styles.instructionStep}>1. Clean the back of your arm with alcohol</Text>
-            <Text style={styles.instructionStep}>2. Remove the adhesive backing from the sensor</Text>
-            <Text style={styles.instructionStep}>3. Apply the sensor to the back of your arm</Text>
-            <Text style={styles.instructionStep}>4. Press the button below to scan the sensor</Text>
+        {/* Scan Instructions - Only show if no sensor is active */}
+        {!currentSensor && (
+          <View style={styles.sectionContainer}>
+            <Text style={styles.sectionTitle}>How to Apply Your Sensor</Text>
+            
+            <View style={styles.instructionsContainer}>
+              <Text style={styles.instructionStep}>1. Clean the back of your arm with alcohol</Text>
+              <Text style={styles.instructionStep}>2. Remove the adhesive backing from the sensor</Text>
+              <Text style={styles.instructionStep}>3. Apply the sensor to the back of your arm</Text>
+              <Text style={styles.instructionStep}>4. Press the scan button to activate the sensor</Text>
+            </View>
+            
+            <TouchableOpacity
+              style={styles.scanButton}
+              onPress={handleScan}
+              disabled={scanning || processing}
+            >
+              {scanning ? (
+                <ActivityIndicator size="small" color="white" />
+              ) : (
+                <>
+                  <Ionicons name="scan-outline" size={24} color="white" style={styles.scanIcon} />
+                  <Text style={styles.scanButtonText}>Scan New Sensor</Text>
+                </>
+              )}
+            </TouchableOpacity>
           </View>
-          
-          <TouchableOpacity
-            style={styles.scanButton}
-            onPress={handleScan}
-            disabled={scanning || processing}
-          >
-            {scanning ? (
-              <ActivityIndicator size="small" color="white" />
-            ) : (
-              <>
-                <Ionicons name="scan-outline" size={24} color="white" style={styles.scanIcon} />
-                <Text style={styles.scanButtonText}>Scan New Sensor</Text>
-              </>
-            )}
-          </TouchableOpacity>
-        </View>
+        )}
         
         {/* Sensor Information */}
         <View style={styles.sectionContainer}>
@@ -744,6 +933,14 @@ const StartSensorScreen = () => {
         {/* Spacing at the bottom */}
         <View style={{ height: 40 }} />
       </ScrollView>
+      
+      {/* NFC Scan Guide Modal */}
+      <NfcScanGuide
+        visible={showScanGuide}
+        onTimeout={handleScanTimeout}
+        timeoutDuration={30000}
+        message="Hold your phone near the sensor to scan"
+      />
     </SafeAreaView>
   );
 };

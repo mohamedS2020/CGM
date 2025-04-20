@@ -24,6 +24,65 @@ import GlucoseCalculationService from '../../services/GlucoseCalculationService'
 import GlucoseMonitoringService from '../../services/GlucoseMonitoringService';
 import NfcService from '../../services/NfcService';
 
+// Custom Tooltip component
+interface TooltipProps {
+  x: number;
+  y: number;
+  text: string;
+  position?: 'top' | 'bottom';
+  backgroundColor?: string;
+  color?: string;
+  width?: number;
+  height?: number;
+  borderRadius?: number;
+  visible?: boolean;
+}
+
+const Tooltip = ({ 
+  x, 
+  y, 
+  text, 
+  position = 'top', 
+  backgroundColor = '#333', 
+  color = '#fff', 
+  width = 120, 
+  height = 50, 
+  borderRadius = 8, 
+  visible = true 
+}: TooltipProps) => {
+  if (!visible) return null;
+  
+  const positionStyles = {
+    top: { bottom: y + 10 },
+    bottom: { top: y + 10 }
+  };
+  
+  return (
+    <View 
+      style={[
+        {
+          position: 'absolute' as const,
+          left: x - width / 2,
+          width,
+          backgroundColor,
+          borderRadius,
+          padding: 8,
+          alignItems: 'center' as const,
+          justifyContent: 'center' as const,
+          zIndex: 999
+        },
+        positionStyles[position as keyof typeof positionStyles]
+      ]}
+    >
+      {text.split('\n').map((line: string, i: number) => (
+        <Text key={i} style={{ color, fontSize: 12, textAlign: 'center' as const }}>
+          {line}
+        </Text>
+      ))}
+    </View>
+  );
+};
+
 // Initialize NFC Manager
 NfcManager.start();
 
@@ -50,7 +109,7 @@ const HomeScreen = () => {
   
   // References
   const appStateRef = useRef(AppState.currentState);
-  const nfcCheckIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const nfcCheckIntervalRef = useRef<number | null>(null);
   
   // Get service instances
   const nfcService = SensorNfcService.getInstance();
@@ -64,18 +123,39 @@ const HomeScreen = () => {
     try {
       setLoading(true);
       
-      // Get readings using the service
-      const readings = await MeasurementService.getReadings(user.uid, { 
-        timeframe: 'week',
-        limit: 100 
-      });
+      // Get latest reading first to show as current value
+      const latestReading = await MeasurementService.getLatestReading(user.uid);
+      
+      // If we have a latest reading, make sure it's displayed
+      if (latestReading) {
+        setLastReading(latestReading);
+      }
+      
+      // Fetch readings based on the selected timeframe
+      let readings: GlucoseReading[] = [];
+      
+      switch (chartTimeframe) {
+        case 'hour':
+          readings = await MeasurementService.getHourlyReadings(user.uid);
+          break;
+        case 'day':
+          readings = await MeasurementService.getDailyReadings(user.uid);
+          break;
+        case 'week':
+          readings = await MeasurementService.getWeeklyReadings(user.uid);
+          break;
+      }
+      
+      // If we're in hour view and have a latest reading but no historical readings,
+      // add the latest reading to the chart data
+      if (chartTimeframe === 'hour' && readings.length === 0 && latestReading) {
+        readings = [latestReading];
+      }
       
       setGlucoseReadings(readings);
       
-      if (readings.length > 0) {
-        setLastReading(readings[0]);
-      } else {
-        // If no readings, create mock data for testing
+      // If no readings at all, create mock data for testing
+      if (!latestReading && readings.length === 0) {
         const mockReading = MeasurementService.createMockReading();
         setLastReading(mockReading);
         
@@ -97,17 +177,115 @@ const HomeScreen = () => {
     if (!user) return;
     
     try {
-      // Create and add 50 mock readings
-      for (let i = 0; i < 50; i++) {
-        const mockReading = MeasurementService.createMockReading();
+      console.log('Creating mock glucose data for testing...');
+      
+      // Clear any existing mock data first
+      await MeasurementService.clearReadings(user.uid);
+      
+      const readings = [];
+      const now = new Date();
+      
+      // Create data for the past week with realistic patterns
+      
+      // Create hourly readings for the past 24 hours (more frequent for recent hours)
+      for (let i = 0; i < 24; i++) {
+        // How many readings per hour (more recent = more readings)
+        const readingsPerHour = i < 2 ? 12 : i < 6 ? 4 : 1;
         
-        // Set timestamp to be i hours ago
-        const now = new Date();
-        mockReading.timestamp = new Date(now.getTime() - i * 3600000);
-        
-        // Add to Firestore
-        await MeasurementService.addReading(user.uid, mockReading);
+        for (let j = 0; j < readingsPerHour; j++) {
+          const hourOffset = i;
+          const minuteOffset = j * (60 / readingsPerHour);
+          
+          const timestamp = new Date(now);
+          timestamp.setHours(now.getHours() - hourOffset);
+          timestamp.setMinutes(now.getMinutes() - minuteOffset);
+          
+          // Base glucose value - simulate a realistic curve with meals
+          let baseValue = 100;
+          
+          // Morning spike (7-9am)
+          const hour = timestamp.getHours();
+          if (hour >= 7 && hour <= 9) {
+            baseValue += 40;
+          }
+          // Lunch spike (12-2pm)
+          else if (hour >= 12 && hour <= 14) {
+            baseValue += 50;
+          }
+          // Dinner spike (6-8pm)
+          else if (hour >= 18 && hour <= 20) {
+            baseValue += 60;
+          }
+          // Night dip (1-4am)
+          else if (hour >= 1 && hour <= 4) {
+            baseValue -= 20;
+          }
+          
+          // Add some randomness
+          const randomVariation = Math.floor(Math.random() * 20) - 10;
+          let glucoseValue = baseValue + randomVariation;
+          
+          // Ensure realistic range
+          glucoseValue = Math.max(60, Math.min(240, glucoseValue));
+          
+          readings.push({
+            value: glucoseValue,
+            timestamp,
+            isAlert: glucoseValue < 70 || glucoseValue > 180,
+            comment: i === 0 && j === 0 ? 'Latest reading' : ''
+          });
+        }
       }
+      
+      // Add some daily data for the past week
+      for (let day = 1; day <= 7; day++) {
+        if (day === 1) continue; // Skip today as we already have hourly data
+        
+        // Add 3-6 readings per day
+        const readingsPerDay = Math.floor(Math.random() * 4) + 3;
+        
+        for (let j = 0; j < readingsPerDay; j++) {
+          const timestamp = new Date(now);
+          timestamp.setDate(now.getDate() - day);
+          
+          // Spread readings throughout the day
+          const hour = 8 + j * (14 / readingsPerDay); // Between 8am and 10pm
+          timestamp.setHours(hour);
+          timestamp.setMinutes(Math.floor(Math.random() * 60));
+          
+          // Generate realistic glucose pattern
+          let baseValue = 110;
+          
+          // Add meal patterns
+          if (hour >= 7 && hour <= 9) {
+            baseValue += 40; // Breakfast
+          } else if (hour >= 12 && hour <= 14) {
+            baseValue += 50; // Lunch
+          } else if (hour >= 18 && hour <= 20) {
+            baseValue += 55; // Dinner
+          }
+          
+          // Add some randomness
+          const randomVariation = Math.floor(Math.random() * 30) - 15;
+          let glucoseValue = baseValue + randomVariation;
+          
+          // Ensure realistic range
+          glucoseValue = Math.max(65, Math.min(220, glucoseValue));
+          
+          readings.push({
+            value: glucoseValue,
+            timestamp,
+            isAlert: glucoseValue < 70 || glucoseValue > 180
+          });
+        }
+      }
+      
+      // Save all the mock readings
+      for (const reading of readings) {
+        await MeasurementService.addReading(user.uid, reading);
+      }
+      
+      console.log(`Created ${readings.length} mock readings`);
       
       // Fetch again to get the saved data
       await fetchGlucoseReadings();
@@ -502,50 +680,24 @@ const HomeScreen = () => {
 
   // Filter readings based on selected timeframe
   const getFilteredReadings = (): GlucoseReading[] => {
-    if (!glucoseReadings.length) return [];
-  
-    const now = new Date();
-    let cutoffTime: Date;
-  
-    switch (chartTimeframe) {
-      case 'hour':
-        cutoffTime = new Date(now.getTime() - 60 * 60 * 1000); // 1 hour ago
-        break;
-      case 'week':
-        cutoffTime = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000); // 7 days ago
-        break;
-      case 'day':
-      default:
-        cutoffTime = new Date(now.getTime() - 24 * 60 * 60 * 1000); // 24 hours ago
-        break;
-    }
-  
-    return glucoseReadings
-      .filter(reading => {
-        const ts = new Date(reading.timestamp);
-        return !isNaN(ts.getTime()) && ts >= cutoffTime;
-      })
-      .map(reading => ({
-        ...reading,
-        timestamp: new Date(reading.timestamp), // Force it to a Date object
-      }));
+    return glucoseReadings;
   };
   
   // Prepare data for the chart
   const getChartData = () => {
     const filteredReadings = getFilteredReadings();
-  
+    
     // Ensure readings are sorted by timestamp (oldest to newest for chart)
     const sortedReadings = [...filteredReadings].sort(
       (a, b) => a.timestamp.getTime() - b.timestamp.getTime()
     );
-  
+    
     // Format the data for the chart
     return {
-      labels: sortedReadings.map(reading => {
+      labels: sortedReadings.map((reading, index) => {
         const date = new Date(reading.timestamp);
         if (isNaN(date.getTime())) return ''; // Prevent invalid date formatting
-  
+        
         if (chartTimeframe === 'hour') {
           return `${date.getHours().toString().padStart(2, '0')}:${date
             .getMinutes()
@@ -554,14 +706,27 @@ const HomeScreen = () => {
         } else if (chartTimeframe === 'week') {
           return `${date.getMonth() + 1}/${date.getDate()}`;
         } else {
-          return `${date.getHours().toString().padStart(2, '0')}:00`;
+          // Day view - only show some hours to prevent label crowding
+          // For 24 data points, show only every 4 hours
+          const hour = date.getHours();
+          if (sortedReadings.length >= 20) {
+            // Many points - show fewer labels
+            return hour % 4 === 0 ? `${hour.toString().padStart(2, '0')}:00` : '';
+          } else if (sortedReadings.length >= 12) {
+            // Medium number of points - show more labels
+            return hour % 3 === 0 ? `${hour.toString().padStart(2, '0')}:00` : '';
+          } else {
+            // Few points - can show all labels
+            return `${hour.toString().padStart(2, '0')}:00`;
+          }
         }
       }),
       datasets: [
         {
           data: sortedReadings.map(reading => {
+            // Filter out zero values (used for placeholder data) - will be skipped in chart
             const value = reading.value;
-            return Number.isFinite(value) ? value : 0; // Sanitize value
+            return value === 0 ? 0 : value; // Replace null with 0 instead
           }),
           color: (opacity = 1) => `rgba(67, 97, 238, ${opacity})`,
           strokeWidth: 2,
@@ -582,6 +747,53 @@ const HomeScreen = () => {
     return '#FFC107'; // Warning (yellow)
   };
   
+  // Format reading value for display
+  const formatGlucoseValue = (value: number | null): string => {
+    if (value === null || value === 0) return 'No data';
+    return `${value} mg/dL`;
+  };
+  
+  // Format timestamp based on chart view
+  const formatTimestamp = (date: Date, view: 'hour' | 'day' | 'week'): string => {
+    if (!date || isNaN(date.getTime())) return '';
+    
+    switch (view) {
+      case 'hour':
+        return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      case 'day':
+        return `${date.getHours().toString().padStart(2, '0')}:00`;
+      case 'week':
+        return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+      default:
+        return date.toLocaleString();
+    }
+  };
+  
+  // Get tooltip content for a data point
+  const getTooltipContent = (dataPoint: any, index: number): string => {
+    if (!glucoseReadings[index]) return '';
+    
+    const reading = glucoseReadings[index];
+    const value = formatGlucoseValue(reading.value);
+    const time = formatTimestamp(reading.timestamp, chartTimeframe);
+    
+    // Different tooltip content based on timeframe
+    if (chartTimeframe === 'hour') {
+      // For hourly view, show exact time and value
+      return `${value}\n${time}${reading.comment ? `\n${reading.comment}` : ''}`;
+    } else if (chartTimeframe === 'day') {
+      // For daily view, show hour and average value
+      const hour = reading.timestamp.getHours();
+      return `${value}\n${hour}:00 - ${hour+1}:00${reading.comment ? `\n${reading.comment}` : ''}`;
+    } else {
+      // For weekly view, show date and average value
+      const date = reading.timestamp.toLocaleDateString([], { 
+        month: 'short', 
+        day: 'numeric' 
+      });
+      return `${value}\n${date}${reading.comment ? `\n${reading.comment}` : ''}`;
+    }
+  };
 
   // Check NFC status periodically
   useEffect(() => {
@@ -738,6 +950,11 @@ const HomeScreen = () => {
       subscription.remove();
     };
   }, []);
+
+  // When the timeframe changes, refetch the data
+  useEffect(() => {
+    fetchGlucoseReadings();
+  }, [chartTimeframe, user]);
 
   // Render monitoring controls
   const renderMonitoringControls = () => {
@@ -903,31 +1120,44 @@ const HomeScreen = () => {
       </View>
       
       {/* Chart Timeframe Selection */}
-      <View style={styles.chartControls}>
-        <TouchableOpacity
-          style={[styles.timeframeButton, chartTimeframe === 'hour' && styles.activeTimeframeButton]}
-          onPress={() => setChartTimeframe('hour')}
-        >
-          <Text style={[styles.timeframeText, chartTimeframe === 'hour' && styles.activeTimeframeText]}>
-            Hour
+      <View style={styles.chartContainer}>
+        <View style={styles.chartHeader}>
+          <Text style={styles.chartTitle}>Glucose History</Text>
+          <Text style={styles.chartSubtitle}>
+            {chartTimeframe === 'hour' 
+              ? 'Individual readings from past 60 minutes' 
+              : chartTimeframe === 'day' 
+                ? 'Hourly averages from past 24 hours' 
+                : 'Daily averages from past 7 days'}
           </Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.timeframeButton, chartTimeframe === 'day' && styles.activeTimeframeButton]}
-          onPress={() => setChartTimeframe('day')}
-        >
-          <Text style={[styles.timeframeText, chartTimeframe === 'day' && styles.activeTimeframeText]}>
-            Day
-          </Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.timeframeButton, chartTimeframe === 'week' && styles.activeTimeframeButton]}
-          onPress={() => setChartTimeframe('week')}
-        >
-          <Text style={[styles.timeframeText, chartTimeframe === 'week' && styles.activeTimeframeText]}>
-            Week
-          </Text>
-        </TouchableOpacity>
+        </View>
+        
+        <View style={styles.chartControls}>
+          <TouchableOpacity
+            style={[styles.timeframeButton, chartTimeframe === 'hour' && styles.activeTimeframeButton]}
+            onPress={() => setChartTimeframe('hour')}
+          >
+            <Text style={[styles.timeframeText, chartTimeframe === 'hour' && styles.activeTimeframeText]}>
+              Hour
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.timeframeButton, chartTimeframe === 'day' && styles.activeTimeframeButton]}
+            onPress={() => setChartTimeframe('day')}
+          >
+            <Text style={[styles.timeframeText, chartTimeframe === 'day' && styles.activeTimeframeText]}>
+              Day
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.timeframeButton, chartTimeframe === 'week' && styles.activeTimeframeButton]}
+            onPress={() => setChartTimeframe('week')}
+          >
+            <Text style={[styles.timeframeText, chartTimeframe === 'week' && styles.activeTimeframeText]}>
+              Week
+            </Text>
+          </TouchableOpacity>
+        </View>
       </View>
       
       {/* Glucose History Chart */}
@@ -935,7 +1165,7 @@ const HomeScreen = () => {
         {glucoseReadings.length > 0 ? (
           <LineChart
             data={getChartData()}
-            width={screenWidth - 40}
+            width={screenWidth - 20}
             height={220}
             chartConfig={{
               backgroundColor: '#ffffff',
@@ -944,11 +1174,8 @@ const HomeScreen = () => {
               decimalPlaces: 0,
               color: (opacity = 1) => `rgba(67, 97, 238, ${opacity})`,
               labelColor: (opacity = 1) => `rgba(0, 0, 0, ${opacity})`,
-              style: {
-                borderRadius: 16,
-              },
               propsForDots: {
-                r: '5',
+                r: '4',
                 strokeWidth: '2',
                 stroke: '#4361EE',
               },
@@ -956,30 +1183,28 @@ const HomeScreen = () => {
                 stroke: '#E0E7FF',
                 strokeWidth: 1,
               },
-              formatYLabel: (yValue) => {
-                // Prevent invalid values from being displayed
-                if (!yValue || yValue === 'undefined' || yValue === 'NaN' || yValue.includes('Infinity')) {
-                  return '0';
-                }
-                const numValue = parseFloat(yValue);
-                if (!Number.isFinite(numValue) || numValue === Infinity || numValue === -Infinity) {
-                  return '0';
-                }
-                return yValue;
+              // Ensure y-axis labels fit by setting proper margin/padding
+              propsForLabels: {
+                fontSize: 10,
               },
-              formatXLabel: (xLabel) => {
-                return String(xLabel || '').substring(0, 5);
-              }
+              // Make sure label formatting works correctly
+              formatYLabel: (label) => label,
             }}
-            bezier
-            style={styles.chart}
+            withVerticalLabels={true}
+            withHorizontalLabels={true}
             yAxisLabel=""
             yAxisSuffix=" mg/dL"
-            withDots={getFilteredReadings().length < 24}
+            withShadow={false}
+            bezier
+            style={{
+              marginVertical: 8,
+              borderRadius: 16,
+            }}
+            withDots={true}
             withInnerLines={true}
-            withOuterLines={true}
+            withVerticalLines={true}
             withHorizontalLines={true}
-            withVerticalLines={false}
+            segments={4}
           />
         ) : (
           <View style={styles.noChartDataContainer}>
@@ -1095,10 +1320,27 @@ const styles = StyleSheet.create({
     fontWeight: '500',
     color: '#666',
   },
+  chartContainer: {
+    alignItems: 'center',
+    marginVertical: 10,
+    paddingHorizontal: 20,
+  },
+  chartHeader: {
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  chartTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#333',
+  },
+  chartSubtitle: {
+    fontSize: 14,
+    color: '#666',
+  },
   chartControls: {
     flexDirection: 'row',
     justifyContent: 'center',
-    marginHorizontal: 20,
     marginBottom: 10,
   },
   timeframeButton: {
@@ -1113,19 +1355,15 @@ const styles = StyleSheet.create({
   },
   timeframeText: {
     fontSize: 14,
-    color: '#4361EE',
+    color: '#666',
   },
   activeTimeframeText: {
     color: 'white',
   },
-  chartContainer: {
-    alignItems: 'center',
-    marginVertical: 10,
-    paddingHorizontal: 20,
-  },
   chart: {
     borderRadius: 16,
     paddingRight: 20,
+    marginTop: 10,
   },
   noChartDataContainer: {
     width: screenWidth - 40,
