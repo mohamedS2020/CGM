@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   View, 
   Text, 
@@ -33,10 +33,19 @@ const SignInScreen = () => {
   const [authError, setAuthError] = useState<string>('');
   const [showPassword, setShowPassword] = useState(false);
   const [showErrorModal, setShowErrorModal] = useState(false);
+  const [attemptCount, setAttemptCount] = useState(0);
   const fadeAnim = useState(new Animated.Value(0))[0];
+  const shakeAnim = useState(new Animated.Value(0))[0];
   
   const navigation = useNavigation<SignInScreenNavigationProp>();
   const { login } = useAuth();
+  
+  // Reset error state when email or password changes
+  useEffect(() => {
+    if (authError) {
+      setAuthError('');
+    }
+  }, [email, password]);
   
   const validateEmail = (email: string) => {
     const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -73,6 +82,8 @@ const SignInScreen = () => {
       await AsyncStorage.setItem(TEMP_PASSWORD_KEY, password);
       
       await login(email, password);
+      // Reset attempt count on successful login
+      setAttemptCount(0);
       // Navigation will automatically redirect to home if login is successful
     } catch (error: any) {
       let errorMessage = 'Failed to sign in';
@@ -83,20 +94,36 @@ const SignInScreen = () => {
       } else if (error.code === 'auth/user-disabled') {
         errorMessage = 'This account has been disabled.';
       } else if (error.code === 'auth/user-not-found' || error.code === 'auth/invalid-credential' || error.code === 'auth/wrong-password') {
-        errorMessage = 'Email or Password is incorrect.';
+        setAttemptCount(prevCount => prevCount + 1);
+        
+        if (attemptCount >= 2) {
+          errorMessage = 'Multiple failed login attempts. Please verify your credentials or use "Forgot password" to reset.';
+        } else {
+          errorMessage = 'Email or Password is incorrect. Please try again.';
+        }
       } else if (error.code === 'auth/too-many-requests') {
-        errorMessage = 'Too many failed login attempts. Please try again later.';
+        errorMessage = 'Too many failed login attempts. Please try again later or reset your password.';
       } else if (error.message) {
         errorMessage = error.message;
       }
       
       setAuthError(errorMessage);
       setShowErrorModal(true);
+      
+      // Animate the modal appearance
       Animated.timing(fadeAnim, {
         toValue: 1,
         duration: 300,
         useNativeDriver: true,
       }).start();
+      
+      // Add shake animation to input fields
+      Animated.sequence([
+        Animated.timing(shakeAnim, { toValue: 10, duration: 50, useNativeDriver: true }),
+        Animated.timing(shakeAnim, { toValue: -10, duration: 50, useNativeDriver: true }),
+        Animated.timing(shakeAnim, { toValue: 10, duration: 50, useNativeDriver: true }),
+        Animated.timing(shakeAnim, { toValue: 0, duration: 50, useNativeDriver: true })
+      ]).start();
     } finally {
       setLoading(false);
     }
@@ -121,22 +148,24 @@ const SignInScreen = () => {
         
         <View style={styles.inputContainer}>
           <Text style={styles.inputLabel}>Email</Text>
-          <TextInput
-            style={[styles.input, errors.email ? styles.inputError : null]}
-            placeholder="your@email.com"
-            value={email}
-            onChangeText={(text) => {
-              setEmail(text);
-              if (errors.email) {
-                const { email, ...rest } = errors;
-                setErrors(rest);
-              }
-            }}
-            keyboardType="email-address"
-            autoCapitalize="none"
-            textContentType="emailAddress"
-            autoComplete="email"
-          />
+          <Animated.View style={{ transform: [{ translateX: shakeAnim }] }}>
+            <TextInput
+              style={[styles.input, errors.email || authError ? styles.inputError : null]}
+              placeholder="your@email.com"
+              value={email}
+              onChangeText={(text) => {
+                setEmail(text);
+                if (errors.email) {
+                  const { email, ...rest } = errors;
+                  setErrors(rest);
+                }
+              }}
+              keyboardType="email-address"
+              autoCapitalize="none"
+              textContentType="emailAddress"
+              autoComplete="email"
+            />
+          </Animated.View>
           {errors.email ? (
             <Text style={styles.errorText}>{errors.email}</Text>
           ) : null}
@@ -144,9 +173,9 @@ const SignInScreen = () => {
         
         <View style={styles.inputContainer}>
           <Text style={styles.inputLabel}>Password</Text>
-          <View style={styles.passwordContainer}>
+          <Animated.View style={[styles.passwordContainer, { transform: [{ translateX: shakeAnim }] }]}>
             <TextInput
-              style={[styles.passwordInput, errors.password ? styles.inputError : null]}
+              style={[styles.passwordInput, errors.password || authError ? styles.inputError : null]}
               placeholder="Your password"
               value={password}
               onChangeText={(text) => {
@@ -170,7 +199,7 @@ const SignInScreen = () => {
                 color="#666"
               />
             </TouchableOpacity>
-          </View>
+          </Animated.View>
           {errors.password ? (
             <Text style={styles.errorText}>{errors.password}</Text>
           ) : null}
@@ -197,16 +226,29 @@ const SignInScreen = () => {
             <Animated.View 
               style={[styles.modalContent, { opacity: fadeAnim }]}
             >
-              <View style={styles.modalHeader}>
+              <View style={styles.modalIconContainer}>
               </View>
-              <Text style={styles.modalTitle}>Wrong credentials</Text>
+              <Text style={styles.modalTitle}>Authentication Failed</Text>
               <Text style={styles.modalMessage}>{authError}</Text>
-              <TouchableOpacity
-                style={styles.modalButton}
-                onPress={() => setShowErrorModal(false)}
-              >
-                <Text style={styles.modalButtonText}>Try Again</Text>
-              </TouchableOpacity>
+              <View style={styles.modalButtonsContainer}>
+                {attemptCount >= 2 && (
+                  <TouchableOpacity
+                    style={styles.modalSecondaryButton}
+                    onPress={() => {
+                      setShowErrorModal(false);
+                      navigation.navigate('ForgotPassword');
+                    }}
+                  >
+                    <Text style={styles.modalSecondaryButtonText}>Reset Password</Text>
+                  </TouchableOpacity>
+                )}
+                <TouchableOpacity
+                  style={[styles.modalButton, attemptCount >= 2 && { flex: 1, marginLeft: 8 }]}
+                  onPress={() => setShowErrorModal(false)}
+                >
+                  <Text style={styles.modalButtonText}>Try Again</Text>
+                </TouchableOpacity>
+              </View>
             </Animated.View>
           </TouchableOpacity>
         </Modal>
@@ -237,53 +279,75 @@ const SignInScreen = () => {
 const styles = StyleSheet.create({
   modalOverlay: {
     flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.4)',
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
     justifyContent: 'center',
     alignItems: 'center',
   },
   modalContent: {
     backgroundColor: 'white',
     borderRadius: 20,
-    padding: 20,
-    width: '80%',
+    padding: 24,
+    width: '85%',
     alignItems: 'center',
     shadowColor: '#000',
     shadowOffset: {
       width: 0,
-      height: 2,
+      height: 4,
     },
-    shadowOpacity: 0.25,
-    shadowRadius: 4,
-    elevation: 5,
+    shadowOpacity: 0.3,
+    shadowRadius: 6,
+    elevation: 8,
   },
-  modalHeader: {
-    marginBottom: 15,
+  modalIconContainer: {
+    marginBottom: 16,
+    alignItems: 'center',
   },
   modalTitle: {
-    fontSize: 20,
+    fontSize: 22,
     fontWeight: 'bold',
     color: '#333',
-    marginBottom: 10,
+    marginBottom: 12,
     textAlign: 'center',
   },
   modalMessage: {
     fontSize: 16,
     color: '#666',
-    marginBottom: 20,
+    marginBottom: 24,
     textAlign: 'center',
     lineHeight: 22,
+  },
+  modalButtonsContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    width: '100%',
   },
   modalButton: {
     backgroundColor: '#4361EE',
     paddingVertical: 12,
-    paddingHorizontal: 30,
+    paddingHorizontal: 20,
     borderRadius: 8,
-    width: '100%',
+    flex: 1,
   },
   modalButtonText: {
     color: '#fff',
     fontSize: 16,
     fontWeight: 'bold',
+    textAlign: 'center',
+  },
+  modalSecondaryButton: {
+    backgroundColor: '#f8f9fa',
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#ddd',
+    flex: 1,
+    marginRight: 8,
+  },
+  modalSecondaryButtonText: {
+    color: '#666',
+    fontSize: 16,
+    fontWeight: '500',
     textAlign: 'center',
   },
   authErrorText: {
