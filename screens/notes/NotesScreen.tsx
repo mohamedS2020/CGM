@@ -510,7 +510,7 @@ const styles = StyleSheet.create({
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
     paddingBottom: Platform.OS === 'ios' ? 30 : 0,
-    height: '85%',
+    height: '70%',
   },
   modalHeader: {
     flexDirection: 'row',
@@ -564,7 +564,7 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     borderRadius: 8,
     alignItems: 'center',
-    marginTop: 210,
+    marginTop: 175,
   },
   saveButtonText: {
     color: 'white',
