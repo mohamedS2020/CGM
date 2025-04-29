@@ -642,6 +642,29 @@ const StartSensorScreen = () => {
     }
   };
   
+  // Handle cancel scanning
+  const handleCancelScan = () => {
+    Alert.alert(
+      'Cancel Scan',
+      'Are you sure you want to cancel?',
+      [
+        {
+          text: 'No',
+          style: 'cancel'
+        },
+        {
+          text: 'Yes',
+          onPress: async () => {
+            console.log('[StartSensorScreen] User confirmed scan cancellation');
+            setShowScanGuide(false);
+            setScanning(false);
+            await ensureNfcCleanup();
+          }
+        }
+      ]
+    );
+  };
+  
   // Handle scan guide timeout
   const handleScanTimeout = () => {
     setShowScanGuide(false);
@@ -938,6 +961,7 @@ const StartSensorScreen = () => {
       <NfcScanGuide
         visible={showScanGuide}
         onTimeout={handleScanTimeout}
+        onCancel={handleCancelScan}
         timeoutDuration={30000}
         message="Hold your phone near the sensor to scan"
       />

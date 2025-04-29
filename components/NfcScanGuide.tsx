@@ -7,13 +7,15 @@ import {
   Animated, 
   Easing, 
   Dimensions,
-  Image
+  Image,
+  TouchableOpacity
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 
 interface NfcScanGuideProps {
   visible: boolean;
   onTimeout?: () => void;
+  onCancel?: () => void;
   timeoutDuration?: number; // in milliseconds
   message?: string;
 }
@@ -21,6 +23,7 @@ interface NfcScanGuideProps {
 const NfcScanGuide: React.FC<NfcScanGuideProps> = ({
   visible,
   onTimeout,
+  onCancel,
   timeoutDuration = 30000, // 30 seconds default
   message = 'Hold your phone near the sensor'
 }) => {
@@ -150,6 +153,16 @@ const NfcScanGuide: React.FC<NfcScanGuideProps> = ({
               <Text style={styles.infoText}>Remove phone case if scanning fails</Text>
             </View>
           </View>
+          
+          {onCancel && (
+            <TouchableOpacity 
+              style={styles.cancelButton} 
+              onPress={onCancel}
+            >
+              <Ionicons name="close-circle-outline" size={20} color="white" />
+              <Text style={styles.cancelButtonText}>Cancel</Text>
+            </TouchableOpacity>
+          )}
         </View>
       </View>
     </Modal>
@@ -239,6 +252,21 @@ const styles = StyleSheet.create({
   infoText: {
     fontSize: 14,
     color: '#666',
+    marginLeft: 8,
+  },
+  cancelButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#4CC9F0',
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderRadius: 25,
+    marginTop: 16,
+  },
+  cancelButtonText: {
+    color: 'white',
+    fontSize: 16,
+    fontWeight: '500',
     marginLeft: 8,
   },
 });
