@@ -2,12 +2,23 @@ import { AppState, AppStateStatus, Platform, Alert } from 'react-native';
 import SensorNfcService from './SensorNfcService';
 import GlucoseCalculationService from './GlucoseCalculationService';
 import MeasurementService, { GlucoseReading } from './MeasurementService';
+import FreeStyleLibreService from './FreeStyleLibreService';
+import { SensorType } from './SensorDetectionService';
 
 // Define reading source if not already defined
 export enum ReadingSource {
   MANUAL_SCAN = 'manual_scan',
   AUTO_MONITOR = 'auto_monitor',
-  CALIBRATION = 'calibration'
+  CALIBRATION = 'calibration',
+  LIBRE_SENSOR = 'libre_sensor'
+}
+
+// Extend the GlucoseReading interface to include source
+declare module './MeasurementService' {
+  export interface GlucoseReading {
+    source?: ReadingSource;
+    userId?: string;
+  }
 }
 
 // Default monitoring interval (in milliseconds)
@@ -24,22 +35,27 @@ export default class GlucoseMonitoringService {
   
   private monitoringActive: boolean = false;
   private monitoringInterval: number = DEFAULT_INTERVAL;
-  private timerId: NodeJS.Timeout | null = null;
+  private timerId: number | null = null;
   private userId: string | null = null;
   private lastReading: GlucoseReading | null = null;
   private consecutiveErrorCount: number = 0;
   private maxConsecutiveErrors: number = 3;
   private appState: AppStateStatus = 'active';
-  private nextReadingTimeout: NodeJS.Timeout | null = null;
+  private nextReadingTimeout: number | null = null;
   private nfcAvailable = false;
+  private currentSensorType: SensorType = SensorType.RF430;
   
   // Service instances
   private nfcService: SensorNfcService;
   private glucoseCalculationService: GlucoseCalculationService;
+  private libreService: FreeStyleLibreService;
   
   // Callbacks
   private onNewReadingCallback: ((reading: GlucoseReading) => void) | null = null;
   private onErrorCallback: ((error: Error) => void) | null = null;
+  
+  // App state subscription
+  private appStateSubscription: { remove: () => void } | null = null;
   
   // Singleton pattern
   public static getInstance(): GlucoseMonitoringService {
@@ -66,6 +82,7 @@ export default class GlucoseMonitoringService {
     
     this.nfcService = SensorNfcService.getInstance();
     this.glucoseCalculationService = GlucoseCalculationService.getInstance();
+    this.libreService = FreeStyleLibreService.getInstance();
     
     // Initialize NFC service asynchronously - don't wait or check result here
     // This prevents blocking the constructor and allows initialization to proceed independently
@@ -79,7 +96,22 @@ export default class GlucoseMonitoringService {
     }
     
     // Setup app state monitoring to pause/resume readings when app goes to background/foreground
-    AppState.addEventListener('change', this.handleAppStateChange);
+    this.appStateSubscription = AppState.addEventListener('change', this.handleAppStateChange);
+  }
+  
+  /**
+   * Set the current sensor type
+   */
+  public setSensorType(type: SensorType): void {
+    this.currentSensorType = type;
+    console.log(`GlucoseMonitoringService: Sensor type set to ${type}`);
+  }
+  
+  /**
+   * Get the current sensor type
+   */
+  public getSensorType(): SensorType {
+    return this.currentSensorType;
   }
   
   /**
@@ -184,8 +216,10 @@ export default class GlucoseMonitoringService {
       this.monitoringActive = true;
       this.consecutiveErrorCount = 0;
       
-      // Set up app state change listener
-      AppState.addEventListener('change', this.handleAppStateChange);
+      // Set up app state change listener if not already set
+      if (!this.appStateSubscription) {
+        this.appStateSubscription = AppState.addEventListener('change', this.handleAppStateChange);
+      }
       
       // Take initial reading
       try {
@@ -250,7 +284,10 @@ export default class GlucoseMonitoringService {
     }
     
     // Remove app state change listener
-    AppState.removeEventListener('change', this.handleAppStateChange);
+    if (this.appStateSubscription) {
+      this.appStateSubscription.remove();
+      this.appStateSubscription = null;
+    }
     
     // Reset state
     this.monitoringActive = false;
@@ -349,7 +386,7 @@ export default class GlucoseMonitoringService {
         // Reschedule if app is in background
         this.scheduleNextReading();
       }
-    }, this.monitoringInterval);
+    }, this.monitoringInterval) as unknown as number;
   }
   
   /**
@@ -407,25 +444,35 @@ export default class GlucoseMonitoringService {
         throw new Error('User ID not set. Cannot store reading.');
       }
       
-      // Use the safer NFC reading method to prevent concurrent operations
-      const adcValue = await this.nfcService.safeReadGlucoseSensor();
+      let reading: GlucoseReading;
       
-      // If adcValue is -1, it means another NFC operation was in progress, so skip this cycle
-      if (adcValue === -1) {
-        console.log('Skipping reading cycle - another NFC operation in progress');
-        throw new Error('CONCURRENT_OPERATION: Another NFC operation is already in progress');
+      // Use appropriate service based on sensor type
+      if (this.currentSensorType === SensorType.LIBRE) {
+        // Use FreeStyle Libre service
+        console.log('GlucoseMonitoringService: Reading from FreeStyle Libre sensor');
+        reading = await this.libreService.readGlucoseData();
+      } else {
+        // Use RF430 service (existing implementation)
+        console.log('GlucoseMonitoringService: Reading from RF430 sensor');
+        const adcValue = await this.nfcService.safeReadGlucoseSensor();
+        
+        // If adcValue is -1, it means another NFC operation was in progress, so skip this cycle
+        if (adcValue === -1) {
+          console.log('Skipping reading cycle - another NFC operation in progress');
+          throw new Error('CONCURRENT_OPERATION: Another NFC operation is already in progress');
+        }
+        
+        // Convert ADC value to glucose level
+        const glucoseValue = this.glucoseCalculationService.adcToGlucose(adcValue);
+        
+        // Create reading object
+        reading = {
+          value: glucoseValue,
+          timestamp: new Date(),
+          source: ReadingSource.AUTO_MONITOR,
+          isAlert: this.glucoseCalculationService.isGlucoseInAlertRange(glucoseValue)
+        };
       }
-      
-      // Convert ADC value to glucose level
-      const glucoseValue = this.glucoseCalculationService.adcToGlucose(adcValue);
-      
-      // Create reading object
-      const reading: GlucoseReading = {
-        value: glucoseValue,
-        timestamp: new Date(),
-        // Check if the reading is out of range
-        isAlert: this.glucoseCalculationService.isGlucoseInAlertRange(glucoseValue)
-      };
       
       // Save reading to Firestore
       const readingId = await MeasurementService.addReading(this.userId, reading);
@@ -449,11 +496,11 @@ export default class GlucoseMonitoringService {
       
       // Show alert notification for out-of-range readings
       if (reading.isAlert) {
-        const alertType = glucoseValue < this.glucoseCalculationService.GLUCOSE_LOW ? 'low' : 'high';
+        const alertType = reading.value < this.glucoseCalculationService.GLUCOSE_LOW ? 'low' : 'high';
         
         Alert.alert(
           'Glucose Alert',
-          `Your glucose level is ${alertType} (${glucoseValue} mg/dL).`,
+          `Your glucose level is ${alertType} (${reading.value} mg/dL).`,
           [{ text: 'OK' }]
         );
       }
@@ -497,26 +544,37 @@ export default class GlucoseMonitoringService {
         }
       }
 
-      // Use the safer NFC reading method that handles concurrent operations
-      const adcValue = await this.nfcService.safeReadGlucoseSensor();
+      let reading: GlucoseReading;
       
-      // If adcValue is -1, it means another NFC operation was in progress, so skip this cycle
-      if (adcValue === -1) {
-        console.log('Manual reading aborted - another NFC operation in progress');
-        throw new Error('CONCURRENT_OPERATION: Please wait for any ongoing NFC operations to complete');
-      }
-      
-      // Convert ADC value to glucose level
-      const glucoseValue = this.glucoseCalculationService.adcToGlucose(adcValue);
+      // Use appropriate service based on sensor type
+      if (this.currentSensorType === SensorType.LIBRE) {
+        // Use FreeStyle Libre service
+        console.log('GlucoseMonitoringService: Taking manual reading from FreeStyle Libre sensor');
+        reading = await this.libreService.readGlucoseData();
+        reading.source = ReadingSource.MANUAL_SCAN;
+      } else {
+        // Use RF430 service (existing implementation)
+        console.log('GlucoseMonitoringService: Taking manual reading from RF430 sensor');
+        const adcValue = await this.nfcService.safeReadGlucoseSensor();
+        
+        // If adcValue is -1, it means another NFC operation was in progress, so skip this cycle
+        if (adcValue === -1) {
+          console.log('Manual reading aborted - another NFC operation in progress');
+          throw new Error('CONCURRENT_OPERATION: Please wait for any ongoing NFC operations to complete');
+        }
+        
+        // Convert ADC value to glucose level
+        const glucoseValue = this.glucoseCalculationService.adcToGlucose(adcValue);
 
-      // Create a reading object
-      const reading: GlucoseReading = {
-        value: glucoseValue,
-        timestamp: new Date(),
-        source: ReadingSource.MANUAL_SCAN,
-        userId: this.userId || 'unknown',
-        isAlert: this.glucoseCalculationService.isGlucoseInAlertRange(glucoseValue)
-      };
+        // Create a reading object
+        reading = {
+          value: glucoseValue,
+          timestamp: new Date(),
+          source: ReadingSource.MANUAL_SCAN,
+          userId: this.userId || 'unknown',
+          isAlert: this.glucoseCalculationService.isGlucoseInAlertRange(glucoseValue)
+        };
+      }
 
       // Save reading to database
       if (this.userId) {
@@ -571,7 +629,12 @@ export default class GlucoseMonitoringService {
    */
   public cleanup(): void {
     this.stopMonitoring();
-    AppState.removeEventListener('change', this.handleAppStateChange);
+    
+    // Remove app state change listener (already handled in stopMonitoring)
+    if (this.appStateSubscription) {
+      this.appStateSubscription.remove();
+      this.appStateSubscription = null;
+    }
     
     // Ensure we safely clean up NFC resources
     if (this.nfcService) {

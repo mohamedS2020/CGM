@@ -156,13 +156,8 @@ const HomeScreen = () => {
       
       // If no readings at all, create mock data for testing
       if (!latestReading && readings.length === 0) {
-        const mockReading = MeasurementService.createMockReading();
-        setLastReading(mockReading);
-        
-        // Add some mock data if no readings exist
-        if (process.env.NODE_ENV === 'development') {
-          createMockData();
-        }
+        // Not using mock data anymore as we're using real sensor data
+        console.log('No readings found. Please scan a sensor to get real readings.');
       }
     } catch (error) {
       console.error('Error fetching glucose readings:', error);
@@ -172,128 +167,6 @@ const HomeScreen = () => {
     }
   };
 
-  // Create mock data for development
-  const createMockData = async () => {
-    if (!user) return;
-    
-    try {
-      console.log('Creating mock glucose data for testing...');
-      
-      // Clear any existing mock data first
-      await MeasurementService.clearReadings(user.uid);
-      
-      const readings = [];
-      const now = new Date();
-      
-      // Create data for the past week with realistic patterns
-      
-      // Create hourly readings for the past 24 hours (more frequent for recent hours)
-      for (let i = 0; i < 24; i++) {
-        // How many readings per hour (more recent = more readings)
-        const readingsPerHour = i < 2 ? 12 : i < 6 ? 4 : 1;
-        
-        for (let j = 0; j < readingsPerHour; j++) {
-          const hourOffset = i;
-          const minuteOffset = j * (60 / readingsPerHour);
-          
-          const timestamp = new Date(now);
-          timestamp.setHours(now.getHours() - hourOffset);
-          timestamp.setMinutes(now.getMinutes() - minuteOffset);
-          
-          // Base glucose value - simulate a realistic curve with meals
-          let baseValue = 100;
-          
-          // Morning spike (7-9am)
-          const hour = timestamp.getHours();
-          if (hour >= 7 && hour <= 9) {
-            baseValue += 40;
-          }
-          // Lunch spike (12-2pm)
-          else if (hour >= 12 && hour <= 14) {
-            baseValue += 50;
-          }
-          // Dinner spike (6-8pm)
-          else if (hour >= 18 && hour <= 20) {
-            baseValue += 60;
-          }
-          // Night dip (1-4am)
-          else if (hour >= 1 && hour <= 4) {
-            baseValue -= 20;
-          }
-          
-          // Add some randomness
-          const randomVariation = Math.floor(Math.random() * 20) - 10;
-          let glucoseValue = baseValue + randomVariation;
-          
-          // Ensure realistic range
-          glucoseValue = Math.max(60, Math.min(240, glucoseValue));
-          
-          readings.push({
-            value: glucoseValue,
-            timestamp,
-            isAlert: glucoseValue < 70 || glucoseValue > 180,
-            comment: i === 0 && j === 0 ? 'Latest reading' : ''
-          });
-        }
-      }
-      
-      // Add some daily data for the past week
-      for (let day = 1; day <= 7; day++) {
-        if (day === 1) continue; // Skip today as we already have hourly data
-        
-        // Add 3-6 readings per day
-        const readingsPerDay = Math.floor(Math.random() * 4) + 3;
-        
-        for (let j = 0; j < readingsPerDay; j++) {
-          const timestamp = new Date(now);
-          timestamp.setDate(now.getDate() - day);
-          
-          // Spread readings throughout the day
-          const hour = 8 + j * (14 / readingsPerDay); // Between 8am and 10pm
-          timestamp.setHours(hour);
-          timestamp.setMinutes(Math.floor(Math.random() * 60));
-          
-          // Generate realistic glucose pattern
-          let baseValue = 110;
-          
-          // Add meal patterns
-          if (hour >= 7 && hour <= 9) {
-            baseValue += 40; // Breakfast
-          } else if (hour >= 12 && hour <= 14) {
-            baseValue += 50; // Lunch
-          } else if (hour >= 18 && hour <= 20) {
-            baseValue += 55; // Dinner
-          }
-          
-          // Add some randomness
-          const randomVariation = Math.floor(Math.random() * 30) - 15;
-          let glucoseValue = baseValue + randomVariation;
-          
-          // Ensure realistic range
-          glucoseValue = Math.max(65, Math.min(220, glucoseValue));
-          
-          readings.push({
-            value: glucoseValue,
-            timestamp,
-            isAlert: glucoseValue < 70 || glucoseValue > 180
-          });
-        }
-      }
-      
-      // Save all the mock readings
-      for (const reading of readings) {
-        await MeasurementService.addReading(user.uid, reading);
-      }
-      
-      console.log(`Created ${readings.length} mock readings`);
-      
-      // Fetch again to get the saved data
-      await fetchGlucoseReadings();
-    } catch (error) {
-      console.error('Error creating mock data:', error);
-    }
-  };
-  
   // Take a manual sensor reading
   const handleManualReading = async () => {
     // Check if already scanning

@@ -392,22 +392,33 @@ export default class SensorNfcService {
           alertMessage: 'Hold your phone near the glucose sensor'
         });
         console.log('[SensorNfcService] NFC technology requested successfully');
+        
+        // Get tag info for diagnostic purposes
+        try {
+          const tagInfo = await NfcManager.getTag();
+          console.log('[SensorNfcService] DIAGNOSTIC - Tag info:', JSON.stringify(tagInfo));
+        } catch (tagError) {
+          console.warn('[SensorNfcService] Could not get tag info for diagnostics:', tagError);
+        }
+        
       } catch (error) {
         console.error('[SensorNfcService] Error requesting NFC technology:', error);
         
         // Handle cancellation separately
-        if (error.toString().includes('cancelled') || error.toString().includes('UserCancel')) {
+        if (typeof error === 'object' && error !== null && 'toString' in error && 
+            (error.toString().includes('cancelled') || error.toString().includes('UserCancel'))) {
           console.log('[SensorNfcService] NFC scan was cancelled by the user');
           throw new Error(NfcErrorType.CANCELLED);
         }
         
         // Check for specific Android error messages indicating no tag was found
         if (Platform.OS === 'android') {
-          const errorMessage = error.toString().toLowerCase();
+          const errorMessage = typeof error === 'object' && error !== null && 'toString' in error ? 
+            error.toString().toLowerCase() : 'unknown error';
           if (errorMessage.includes('tag was lost') || 
               errorMessage.includes('tag connection lost') ||
+              errorMessage.includes('tag connection lost') ||
               errorMessage.includes('no tag found') ||
-              errorMessage.includes('tag was not found') ||
               errorMessage.includes('interrupted') ||
               errorMessage.includes('timeout')) {
             console.log('[SensorNfcService] No NFC tag found or tag connection lost');
@@ -420,6 +431,18 @@ export default class SensorNfcService {
       }
       
       try {
+        // DIAGNOSTIC: Try a raw transceive command to check communication
+        try {
+          console.log('[SensorNfcService] DIAGNOSTIC - Attempting raw transceive command...');
+          // Simple ISO 15693 command to get system info
+          const diagnosticCommand = [0x02, 0x2B]; // Get System Info command
+          const diagnosticResponse = await NfcManager.transceive(diagnosticCommand);
+          console.log('[SensorNfcService] DIAGNOSTIC - Raw command response:', 
+            diagnosticResponse ? Array.from(diagnosticResponse) : 'No response');
+        } catch (diagError) {
+          console.log('[SensorNfcService] DIAGNOSTIC - Raw command failed:', diagError);
+        }
+        
         // Configure ADC (only needed once per session)
         console.log('[SensorNfcService] Running glucose reading sequence...');
         const configResult = await this.configureAdc();
@@ -446,6 +469,10 @@ export default class SensorNfcService {
           throw new Error(readResult.error || NfcErrorType.INVALID_RESPONSE);
         }
         
+        // Log the raw data for diagnostic purposes
+        console.log('[SensorNfcService] DIAGNOSTIC - Raw ADC data bytes:', 
+          Array.from(readResult.data).map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join(' '));
+        
         // Parse ADC result
         const adcValue = this.parseAdcResult(readResult.data);
         console.log(`[SensorNfcService] ADC value read successfully: ${adcValue}`);
@@ -469,14 +496,15 @@ export default class SensorNfcService {
   /**
    * Configure ADC0 for glucose sensor
    * Sets ADC0 with PGA gain = 1, CIC filter, 1024 decimation, 14-bit accuracy
+   * Based on sensor.md documentation
    */
   private async configureAdc(): Promise<NfcCommandResult> {
     try {
       console.log('[SensorNfcService] Configuring ADC...');
       
-      // ADC configuration data (14-bit ADC, internal reference)
-      // This is specific to the RF430FRL15xH sensor
-      const configData = new Uint8Array([0x01, 0x02, 0x00, 0x00]); 
+      // Using the exact configuration from sensor.md
+      // Write Block 2 (configure ADC0): 02 21 02 00 00 2C 00 00 00 00 00
+      const configData = new Uint8Array([0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x00]); 
       
       // Send write command to the configuration block
       if (typeof NfcManager.transceive !== 'function') {
@@ -485,10 +513,16 @@ export default class SensorNfcService {
       }
       
       // Prepare ISO 15693 command for writing to block
+      // Complete command should be like: 02 21 02 00 00 2C 00 00 00 00 00
       const payload = this.prepareWriteCommand(SensorNfcService.BLOCK_CONFIG, configData);
+      
+      // Log the exact bytes for diagnostic purposes
+      const payloadHex = Array.from(payload).map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join(' ');
+      console.log('[SensorNfcService] DIAGNOSTIC - ADC config command:', payloadHex);
       
       // Send command and get response
       console.log('[SensorNfcService] Sending ADC configuration command...');
+      console.log('[SensorNfcService] Configuration payload:', Array.from(payload));
       const response = await NfcManager.transceive(payload);
       
       if (!response || response.length < 1) {
@@ -496,7 +530,11 @@ export default class SensorNfcService {
         return { success: false, error: NfcErrorType.INVALID_RESPONSE };
       }
       
-      console.log('[SensorNfcService] ADC configured successfully');
+      // Log response bytes for diagnostics
+      const responseHex = Array.from(response).map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join(' ');
+      console.log('[SensorNfcService] DIAGNOSTIC - ADC config response:', responseHex);
+      
+      console.log('[SensorNfcService] ADC configured successfully, response:', Array.from(response));
       return { success: true };
     } catch (error) {
       console.error('[SensorNfcService] Error configuring ADC:', error);
@@ -507,13 +545,15 @@ export default class SensorNfcService {
   /**
    * Start ADC sampling
    * Triggers one ADC0 sample
+   * Based on sensor.md documentation
    */
   private async startSampling(): Promise<NfcCommandResult> {
     try {
       console.log('[SensorNfcService] Starting ADC sampling...');
       
-      // Command to start ADC sampling
-      const startData = new Uint8Array([0x80, 0x01, 0x00, 0x00]); // Start sampling command
+      // Using the exact command from sensor.md
+      // Write Block 0 (start sampling): 02 21 00 01 00 04 00 01 01 00 00
+      const startData = new Uint8Array([0x01, 0x00, 0x04, 0x00, 0x01, 0x01, 0x00, 0x00]); 
       
       // Send write command to the control block
       if (typeof NfcManager.transceive !== 'function') {
@@ -522,10 +562,16 @@ export default class SensorNfcService {
       }
       
       // Prepare ISO 15693 command for writing to control block
+      // Complete command should be like: 02 21 00 01 00 04 00 01 01 00 00
       const payload = this.prepareWriteCommand(SensorNfcService.BLOCK_CONTROL, startData);
+      
+      // Log the exact bytes for diagnostic purposes
+      const payloadHex = Array.from(payload).map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join(' ');
+      console.log('[SensorNfcService] DIAGNOSTIC - Start sampling command:', payloadHex);
       
       // Send command and get response
       console.log('[SensorNfcService] Sending start sampling command...');
+      console.log('[SensorNfcService] Start sampling payload:', Array.from(payload));
       const response = await NfcManager.transceive(payload);
       
       if (!response || response.length < 1) {
@@ -533,7 +579,11 @@ export default class SensorNfcService {
         return { success: false, error: NfcErrorType.INVALID_RESPONSE };
       }
       
-      console.log('[SensorNfcService] ADC sampling started successfully');
+      // Log response bytes for diagnostics
+      const responseHex = Array.from(response).map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join(' ');
+      console.log('[SensorNfcService] DIAGNOSTIC - Start sampling response:', responseHex);
+      
+      console.log('[SensorNfcService] ADC sampling started successfully, response:', Array.from(response));
       return { success: true };
     } catch (error) {
       console.error('[SensorNfcService] Error starting ADC sampling:', error);
@@ -558,6 +608,10 @@ export default class SensorNfcService {
       // Prepare ISO 15693 command for reading from result block
       const payload = this.prepareReadCommand(SensorNfcService.BLOCK_RESULT);
       
+      // Log the exact bytes for diagnostic purposes
+      const payloadHex = Array.from(payload).map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join(' ');
+      console.log('[SensorNfcService] DIAGNOSTIC - Read result command:', payloadHex);
+      
       // Send command and get response
       console.log('[SensorNfcService] Sending read ADC result command...');
       const response = await NfcManager.transceive(payload);
@@ -568,8 +622,12 @@ export default class SensorNfcService {
         return { success: false, error: NfcErrorType.INVALID_RESPONSE };
       }
       
+      // Log response bytes for diagnostics
+      const responseHex = Array.from(response).map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join(' ');
+      console.log('[SensorNfcService] DIAGNOSTIC - Read result response:', responseHex);
+      
       console.log('[SensorNfcService] ADC result read successfully, data:', Array.from(response));
-      return { success: true, data: response };
+      return { success: true, data: new Uint8Array(response) };
     } catch (error) {
       console.error('[SensorNfcService] Error reading ADC result:', error);
       return { success: false, error: NfcErrorType.COMMUNICATION_ERROR };
@@ -666,11 +724,12 @@ export default class SensorNfcService {
       
       // Set a shorter timeout for sensor detection (3 seconds)
       const timeoutMs = 3000;
-      let timeoutId: NodeJS.Timeout;
+      let timeoutId: ReturnType<typeof setTimeout> = setTimeout(() => {}, 0); // Initialize with dummy timeout
       
       try {
         // Create a promise that will reject after the timeout
         const timeoutPromise = new Promise<never>((_, reject) => {
+          clearTimeout(timeoutId); // Clear the dummy timeout
           timeoutId = setTimeout(() => {
             reject(new Error(NfcErrorType.TIMEOUT));
           }, timeoutMs);
@@ -691,13 +750,15 @@ export default class SensorNfcService {
             console.error('[SensorNfcService] Error during sensor detection:', error);
             
             // Handle cancellation separately
-            if (error.toString().includes('cancelled') || error.toString().includes('UserCancel')) {
+            if (typeof error === 'object' && error !== null && 'toString' in error && 
+                (error.toString().includes('cancelled') || error.toString().includes('UserCancel'))) {
               reject(new Error(NfcErrorType.CANCELLED));
               return;
             }
             
             // Check for specific errors indicating no tag was found
-            const errorMessage = error.toString().toLowerCase();
+            const errorMessage = typeof error === 'object' && error !== null && 'toString' in error ? 
+              error.toString().toLowerCase() : 'unknown error';
             if (errorMessage.includes('tag was lost') || 
                 errorMessage.includes('tag connection lost') ||
                 errorMessage.includes('no tag found') ||
@@ -728,6 +789,105 @@ export default class SensorNfcService {
     } catch (error) {
       console.error('[SensorNfcService] Sensor detection failed:', error);
       throw error;
+    }
+  }
+
+  /**
+   * Diagnostic function to test basic communication with the sensor
+   * This should be used for testing if the sensor can be read from
+   */
+  public async diagnosticTest(): Promise<boolean> {
+    try {
+      console.log('[SensorNfcService] Running sensor diagnostic test...');
+      
+      if (!this.initialized) {
+        console.log('[SensorNfcService] NFC not initialized, initializing...');
+        await this.initialize();
+        
+        if (!this.isNfcSupported) {
+          console.error('[SensorNfcService] NFC not supported on this device');
+          return false;
+        }
+      }
+      
+      // Check if NFC is available
+      const isAvailable = await this.isNfcAvailable();
+      if (!isAvailable) {
+        console.error('[SensorNfcService] NFC not available');
+        return false;
+      }
+      
+      console.log('[SensorNfcService] Requesting NFC technology for diagnostic...');
+      try {
+        // Request NFC V technology (ISO 15693)
+        await NfcManager.requestTechnology(NfcTech.NfcV, {
+          alertMessage: 'Hold your phone near the sensor for diagnostic'
+        });
+        console.log('[SensorNfcService] DIAGNOSTIC - NFC technology granted');
+        
+        // Try to get tag info
+        let tagInfo = null;
+        try {
+          tagInfo = await NfcManager.getTag();
+          console.log('[SensorNfcService] DIAGNOSTIC - Successfully read tag info:', JSON.stringify(tagInfo));
+        } catch (tagError) {
+          console.error('[SensorNfcService] DIAGNOSTIC - Failed to read tag:', tagError);
+          return false;
+        }
+        
+        // Try some basic communication - Get System Info command (ISO 15693)
+        try {
+          console.log('[SensorNfcService] DIAGNOSTIC - Sending Get System Info command...');
+          const sysInfoCmd = [0x02, 0x2B]; // ISO 15693 Get System Info
+          const sysInfoResponse = await NfcManager.transceive(sysInfoCmd);
+          
+          if (sysInfoResponse && sysInfoResponse.length > 0) {
+            const respHex = Array.from(sysInfoResponse).map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join(' ');
+            console.log('[SensorNfcService] DIAGNOSTIC - System Info response:', respHex);
+            console.log('[SensorNfcService] DIAGNOSTIC - Basic communication successful!');
+            return true;
+          } else {
+            console.error('[SensorNfcService] DIAGNOSTIC - Empty system info response');
+            return false;
+          }
+        } catch (sysInfoError) {
+          console.error('[SensorNfcService] DIAGNOSTIC - System info command failed:', sysInfoError);
+          
+          // Try a simpler command - Read Single Block for Block 0
+          try {
+            console.log('[SensorNfcService] DIAGNOSTIC - Trying simpler Read Block 0 command...');
+            const readBlockCmd = [0x02, 0x20, 0x00]; // Read Block 0
+            const readResponse = await NfcManager.transceive(readBlockCmd);
+            
+            if (readResponse && readResponse.length > 0) {
+              const respHex = Array.from(readResponse).map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join(' ');
+              console.log('[SensorNfcService] DIAGNOSTIC - Read Block 0 response:', respHex);
+              console.log('[SensorNfcService] DIAGNOSTIC - Alternative command successful!');
+              return true;
+            } else {
+              console.error('[SensorNfcService] DIAGNOSTIC - Empty read block response');
+              return false;
+            }
+          } catch (readError) {
+            console.error('[SensorNfcService] DIAGNOSTIC - Read block command also failed:', readError);
+            return false;
+          }
+        }
+        
+      } catch (error) {
+        console.error('[SensorNfcService] DIAGNOSTIC - Error in NFC communication:', error);
+        return false;
+      } finally {
+        // Clean up NFC
+        try {
+          await NfcManager.cancelTechnologyRequest();
+        } catch (cleanupError) {
+          console.error('[SensorNfcService] DIAGNOSTIC - Error during cleanup:', cleanupError);
+        }
+      }
+    } catch (error) {
+      console.error('[SensorNfcService] DIAGNOSTIC - Unexpected error:', error);
+      return false;
     }
   }
 } 

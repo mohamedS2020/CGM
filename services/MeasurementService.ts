@@ -371,21 +371,6 @@ class MeasurementService {
   }
 
   /**
-   * Create a mock reading for testing
-   */
-  static createMockReading(): GlucoseReading {
-    // Generate a random value between 70 and 170
-    const value = Math.floor(Math.random() * 100) + 70;
-    
-    return {
-      value: Number.isFinite(value) ? value : 120, // Fallback to 120 if somehow we get an invalid value
-      timestamp: new Date(),
-      comment: Math.random() > 0.7 ? 'This is a mock reading' : undefined, // 30% chance to have a comment
-      isAlert: value < 70 || value > 180 // Mark as alert if outside normal range
-    };
-  }
-
-  /**
    * Clear all readings for a user (for development/testing only)
    * USE WITH CAUTION - this permanently deletes data
    */

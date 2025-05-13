@@ -9,7 +9,7 @@ class NfcService {
   private initializationPromise: Promise<boolean> | null = null;
   // Add a lock to track ongoing NFC operations
   private operationInProgress: boolean = false;
-  private operationTimeout: NodeJS.Timeout | null = null;
+  private operationTimeout: number | null = null;
   
   /**
    * Get singleton instance
@@ -28,9 +28,9 @@ class NfcService {
    * NFC modules aren't fully available in Expo Go
    */
   public isRunningInExpoGo(): boolean {
-    const expoAppId = Constants.expoConfig?.appId;
-    // If app ID starts with 'host.exp.exponent', we're in Expo Go
-    return expoAppId === 'host.exp.exponent' || Constants.appOwnership === 'expo';
+    // Check if running in Expo Go environment
+    // Constants.expoConfig?.appId is deprecated, use Constants.appOwnership instead
+    return Constants.appOwnership === 'expo';
   }
   
   /**
@@ -59,7 +59,7 @@ class NfcService {
         console.log('[NfcService] Operation timeout reached, forcing state to not in progress');
         this.operationInProgress = false;
         this.operationTimeout = null;
-      }, timeoutMs);
+      }, timeoutMs) as unknown as number;
     }
   }
   
@@ -155,7 +155,7 @@ class NfcService {
         
         // Register event listener if supported
         if (isSupported && typeof NfcManager.setEventListener === 'function') {
-          NfcManager.setEventListener(NfcEvents.DiscoverTag, (tag) => {
+          NfcManager.setEventListener(NfcEvents.DiscoverTag, (tag: any) => {
             console.log('[NfcService] Tag discovered:', tag);
           });
           console.log('[NfcService] NFC event listeners registered');
