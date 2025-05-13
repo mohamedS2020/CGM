@@ -12,6 +12,8 @@ import {
 import { doc, setDoc, getDoc } from 'firebase/firestore';
 import { auth, db } from '../firebase';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import NetInfo from '@react-native-community/netinfo';
+import MeasurementService from '../services/MeasurementService';
 
 // Key for storing auth persistence
 const AUTH_PERSISTENCE_KEY = 'cgm_auth_persistence';
@@ -19,10 +21,14 @@ const AUTH_PERSISTENCE_KEY = 'cgm_auth_persistence';
 // Key for storing encrypted user credentials
 const USER_CREDS_KEY = 'cgm_user_credentials';
 
+// Key for caching user profile data
+const USER_DATA_CACHE_KEY = 'cgm_user_data_cache';
+
 interface AuthContextType {
   user: User | null;
   userData: UserData | null;
   loading: boolean;
+  isOnline: boolean;
   signup: (email: string, password: string, userData: UserData) => Promise<void>;
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
@@ -58,16 +64,67 @@ export const AuthProvider: React.FC<{children: React.ReactNode}> = ({ children }
   const [user, setUser] = useState<User | null>(null);
   const [userData, setUserData] = useState<UserData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [isOnline, setIsOnline] = useState(true);
 
-  // Fetch user data from Firestore
+  // Fetch user data from Firestore or local cache
   const fetchUserData = async (userId: string) => {
     try {
-      const userDoc = await getDoc(doc(db, 'users', userId));
-      if (userDoc.exists()) {
-        setUserData(userDoc.data() as UserData);
+      // First check if we're online
+      const netInfoState = await NetInfo.fetch();
+      
+      if (netInfoState.isConnected) {
+        // We're online, try to fetch from Firestore
+        console.log('Online: Fetching user data from Firestore');
+        const userDoc = await getDoc(doc(db, 'users', userId));
+        
+        if (userDoc.exists()) {
+          const fetchedUserData = userDoc.data() as UserData;
+          
+          // Cache the data for offline use
+          await AsyncStorage.setItem(
+            `${USER_DATA_CACHE_KEY}_${userId}`, 
+            JSON.stringify(fetchedUserData)
+          );
+          
+          setUserData(fetchedUserData);
+          return fetchedUserData;
+        } else {
+          console.log('User document does not exist in Firestore');
+        }
+      } else {
+        console.log('Offline: Using cached user data');
+      }
+      
+      // If we're offline or couldn't fetch from Firestore, try to load from cache
+      const cachedUserData = await AsyncStorage.getItem(`${USER_DATA_CACHE_KEY}_${userId}`);
+      
+      if (cachedUserData) {
+        console.log('Using cached user data');
+        const parsedUserData = JSON.parse(cachedUserData) as UserData;
+        setUserData(parsedUserData);
+        return parsedUserData;
+      } else {
+        console.warn('No cached user data available');
+        return null;
       }
     } catch (error) {
       console.error("Error fetching user data:", error);
+      
+      // As a last resort, try to load from cache even if there was an error
+      try {
+        const cachedUserData = await AsyncStorage.getItem(`${USER_DATA_CACHE_KEY}_${userId}`);
+        
+        if (cachedUserData) {
+          console.log('Error occurred, using cached user data');
+          const parsedUserData = JSON.parse(cachedUserData) as UserData;
+          setUserData(parsedUserData);
+          return parsedUserData;
+        }
+      } catch (cacheError) {
+        console.error("Error reading cached user data:", cacheError);
+      }
+      
+      return null;
     }
   };
 
@@ -87,8 +144,23 @@ export const AuthProvider: React.FC<{children: React.ReactNode}> = ({ children }
         email: currentUser.email,
         displayName: currentUser.displayName,
         emailVerified: currentUser.emailVerified,
+        // Include the current timestamp for cache invalidation purposes
+        cachedAt: new Date().toISOString()
       };
+      
+      // Store auth state
       await AsyncStorage.setItem(AUTH_PERSISTENCE_KEY, JSON.stringify(authState));
+      
+      // Also make sure user data is cached for offline use
+      const cachedUserData = await AsyncStorage.getItem(`${USER_DATA_CACHE_KEY}_${currentUser.uid}`);
+      
+      // If we have userData but it's not cached yet, cache it
+      if (userData && !cachedUserData) {
+        await AsyncStorage.setItem(
+          `${USER_DATA_CACHE_KEY}_${currentUser.uid}`, 
+          JSON.stringify(userData)
+        );
+      }
     } else {
       // Remove auth state on logout
       await AsyncStorage.removeItem(AUTH_PERSISTENCE_KEY);
@@ -135,14 +207,36 @@ export const AuthProvider: React.FC<{children: React.ReactNode}> = ({ children }
           if (refreshedUser) {
             await fetchUserData(refreshedUser.uid);
             await persistAuthState(refreshedUser);
+            
+            // Initialize measurement service connectivity monitoring
+            MeasurementService.initConnectivityMonitoring(refreshedUser.uid);
           }
         } catch (error) {
           console.error("Error refreshing user:", error);
           setUser(currentUser);
-          await fetchUserData(currentUser.uid);
+          
+          // Check if we're offline
+          const netInfoState = await NetInfo.fetch();
+          if (!netInfoState.isConnected) {
+            console.log("Device is offline, attempting to load cached user data");
+            // Try to load from cache directly
+            const cachedUserData = await AsyncStorage.getItem(`${USER_DATA_CACHE_KEY}_${currentUser.uid}`);
+            if (cachedUserData) {
+              setUserData(JSON.parse(cachedUserData));
+            }
+          } else {
+            await fetchUserData(currentUser.uid);
+          }
+          
           await persistAuthState(currentUser);
+          
+          // Initialize measurement service connectivity monitoring even if refresh failed
+          MeasurementService.initConnectivityMonitoring(currentUser.uid);
         }
       } else {
+        // No current user, stop measurement service connectivity monitoring
+        MeasurementService.stopConnectivityMonitoring();
+        
         // No current user in Firebase Auth, try to recover from AsyncStorage
         try {
           const storedAuth = await AsyncStorage.getItem(AUTH_PERSISTENCE_KEY);
@@ -186,6 +280,16 @@ export const AuthProvider: React.FC<{children: React.ReactNode}> = ({ children }
     });
 
     return unsubscribe;
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = NetInfo.addEventListener(state => {
+      setIsOnline(state.isConnected);
+    });
+
+    return () => {
+      unsubscribe();
+    };
   }, []);
 
   // Register new user
@@ -249,24 +353,23 @@ export const AuthProvider: React.FC<{children: React.ReactNode}> = ({ children }
   // Logout user
   const logout = async () => {
     try {
-      console.log("Logging out user");
+      // Stop measurement service connectivity monitoring before logout
+      MeasurementService.stopConnectivityMonitoring();
       
-      // First remove the stored credentials to prevent auto re-login
+      // Clear stored credentials to prevent auto-login
       await AsyncStorage.removeItem(USER_CREDS_KEY);
       
-      // Then remove the auth persistence data
+      // Clear auth state persistence
       await AsyncStorage.removeItem(AUTH_PERSISTENCE_KEY);
       
-      // Finally sign out from Firebase
+      // Sign out of Firebase
       await signOut(auth);
       
-      // Explicitly set user state to null to force UI update
+      // Clear current user data
       setUser(null);
       setUserData(null);
-      
-      console.log("Logout completed");
     } catch (error) {
-      console.error("Error during logout: ", error);
+      console.error('Error logging out:', error);
       throw error;
     }
   };
@@ -298,17 +401,49 @@ export const AuthProvider: React.FC<{children: React.ReactNode}> = ({ children }
     if (!user) return;
     
     try {
-      const userRef = doc(db, 'users', user.uid);
-      await setDoc(userRef, updatedUserData, { merge: true });
+      // First, update local state immediately for responsive UI
+      setUserData(prev => prev ? { ...prev, ...updatedUserData } : updatedUserData);
       
-      if (updatedUserData.displayName) {
-        await updateProfile(user, { displayName: updatedUserData.displayName });
+      // Check if we're online
+      const netInfoState = await NetInfo.fetch();
+      
+      if (netInfoState.isConnected) {
+        // We're online, update Firestore
+        const userRef = doc(db, 'users', user.uid);
+        await setDoc(userRef, updatedUserData, { merge: true });
+        
+        if (updatedUserData.displayName) {
+          await updateProfile(user, { displayName: updatedUserData.displayName });
+        }
+      } else {
+        console.log('Offline: Cannot update profile in Firestore. Changes will be cached locally.');
       }
       
-      // Update local state
-      setUserData(prev => prev ? { ...prev, ...updatedUserData } : updatedUserData);
+      // Update the cached data regardless of online status
+      try {
+        // Get current cached data
+        const cachedDataString = await AsyncStorage.getItem(`${USER_DATA_CACHE_KEY}_${user.uid}`);
+        let cachedData: UserData = {};
+        
+        if (cachedDataString) {
+          cachedData = JSON.parse(cachedDataString);
+        }
+        
+        // Merge with updates
+        const updatedCache = { ...cachedData, ...updatedUserData };
+        
+        // Save back to cache
+        await AsyncStorage.setItem(
+          `${USER_DATA_CACHE_KEY}_${user.uid}`, 
+          JSON.stringify(updatedCache)
+        );
+        
+        console.log('Updated profile cache');
+      } catch (cacheError) {
+        console.error("Error updating profile cache:", cacheError);
+      }
     } catch (error) {
-      console.error("Error updating profile: ", error);
+      console.error("Error updating profile:", error);
       throw error;
     }
   };
@@ -317,6 +452,7 @@ export const AuthProvider: React.FC<{children: React.ReactNode}> = ({ children }
     user,
     userData,
     loading,
+    isOnline,
     signup,
     login,
     logout,

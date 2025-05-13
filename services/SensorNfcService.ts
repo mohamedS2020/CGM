@@ -722,8 +722,8 @@ export default class SensorNfcService {
         throw new Error(NfcErrorType.NOT_ENABLED);
       }
       
-      // Set a shorter timeout for sensor detection (3 seconds)
-      const timeoutMs = 3000;
+      // Increase timeout for sensor detection from 3 to 5 seconds
+      const timeoutMs = 5000;
       let timeoutId: ReturnType<typeof setTimeout> = setTimeout(() => {}, 0); // Initialize with dummy timeout
       
       try {
@@ -731,6 +731,7 @@ export default class SensorNfcService {
         const timeoutPromise = new Promise<never>((_, reject) => {
           clearTimeout(timeoutId); // Clear the dummy timeout
           timeoutId = setTimeout(() => {
+            console.log('[SensorNfcService] Sensor detection timed out after', timeoutMs, 'ms');
             reject(new Error(NfcErrorType.TIMEOUT));
           }, timeoutMs);
         });
@@ -749,27 +750,34 @@ export default class SensorNfcService {
           } catch (error) {
             console.error('[SensorNfcService] Error during sensor detection:', error);
             
-            // Handle cancellation separately
-            if (typeof error === 'object' && error !== null && 'toString' in error && 
-                (error.toString().includes('cancelled') || error.toString().includes('UserCancel'))) {
-              reject(new Error(NfcErrorType.CANCELLED));
-              return;
-            }
-            
-            // Check for specific errors indicating no tag was found
-            const errorMessage = typeof error === 'object' && error !== null && 'toString' in error ? 
-              error.toString().toLowerCase() : 'unknown error';
-            if (errorMessage.includes('tag was lost') || 
-                errorMessage.includes('tag connection lost') ||
-                errorMessage.includes('no tag found') ||
-                errorMessage.includes('tag was not found') ||
-                errorMessage.includes('interrupted') ||
-                errorMessage.includes('timeout')) {
-              reject(new Error(NfcErrorType.TAG_NOT_FOUND));
-              return;
+            // Check if the error is a UserCancel or related to the user cancelling the scan
+            if (typeof error === 'object' && error !== null) {
+              const errorStr = error.toString ? error.toString() : String(error);
+              
+              if (errorStr.includes('cancelled') || 
+                  errorStr.includes('UserCancel') || 
+                  errorStr.includes('user canceled')) {
+                console.log('[SensorNfcService] User cancelled the NFC scan');
+                reject(new Error(NfcErrorType.CANCELLED));
+                return;
+              }
+              
+              // Check for specific errors indicating no tag was found
+              const errorMessage = errorStr.toLowerCase();
+              if (errorMessage.includes('tag was lost') || 
+                  errorMessage.includes('tag connection lost') ||
+                  errorMessage.includes('no tag found') ||
+                  errorMessage.includes('tag was not found') ||
+                  errorMessage.includes('interrupted') ||
+                  errorMessage.includes('timeout')) {
+                console.log('[SensorNfcService] No tag was found during scan');
+                reject(new Error(NfcErrorType.TAG_NOT_FOUND));
+                return;
+              }
             }
             
             // Generic message for other communication errors
+            console.log('[SensorNfcService] Communication error during scan');
             reject(new Error(NfcErrorType.COMMUNICATION_ERROR));
           }
         });
@@ -778,17 +786,55 @@ export default class SensorNfcService {
         const result = await Promise.race([detectionPromise, timeoutPromise]);
         clearTimeout(timeoutId);
         return result;
+      } catch (error) {
+        if (error instanceof Error) {
+          const errorType = error.message;
+          
+          // Log the error but handle more gracefully
+          if (errorType === NfcErrorType.CANCELLED) {
+            console.log('[SensorNfcService] Sensor detection was cancelled by user');
+            // For cancellation, we'll throw a specific error so calling code can handle it
+            throw error;
+          } else if (errorType === NfcErrorType.TIMEOUT) {
+            console.log('[SensorNfcService] Sensor detection timed out');
+            // Translate timeout to TAG_NOT_FOUND for consistency in calling code
+            throw new Error(NfcErrorType.TAG_NOT_FOUND);
+          } else if (errorType === NfcErrorType.TAG_NOT_FOUND) {
+            console.log('[SensorNfcService] No sensor tag was found');
+            throw error;
+          } else {
+            console.error('[SensorNfcService] Unexpected error in sensor detection:', error);
+            throw new Error(NfcErrorType.COMMUNICATION_ERROR);
+          }
+        } else {
+          console.error('[SensorNfcService] Non-Error object thrown during sensor detection:', error);
+          throw new Error(NfcErrorType.UNEXPECTED_ERROR);
+        }
       } finally {
         // Always clean up NFC resources
         try {
           await NfcManager.cancelTechnologyRequest();
-        } catch (error) {
-          console.log('[SensorNfcService] Error cancelling technology request:', error);
+        } catch (cleanupError) {
+          console.log('[SensorNfcService] Error cancelling technology request:', cleanupError);
+          // Don't throw from finally block
         }
       }
     } catch (error) {
       console.error('[SensorNfcService] Sensor detection failed:', error);
-      throw error;
+      
+      // Ensure we return a proper Error object with one of our error types
+      if (error instanceof Error) {
+        // Check if it's already one of our error types
+        if (Object.values(NfcErrorType).includes(error.message as NfcErrorType)) {
+          throw error;
+        } else {
+          // Convert to COMMUNICATION_ERROR if not one of our types
+          throw new Error(NfcErrorType.COMMUNICATION_ERROR);
+        }
+      } else {
+        // Handle non-Error objects
+        throw new Error(NfcErrorType.UNEXPECTED_ERROR);
+      }
     }
   }
 

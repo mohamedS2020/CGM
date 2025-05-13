@@ -14,6 +14,8 @@ import {
   SafeAreaView,
   StatusBar
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import NetInfo from '@react-native-community/netinfo';
 import { useAuth } from '../../context/AuthContext';
 import { db } from '../../firebase/firebaseconfig';
 import { collection, addDoc, serverTimestamp, getDocs, query, orderBy, limit, deleteDoc, doc, updateDoc, setDoc, where } from 'firebase/firestore';
@@ -30,6 +32,17 @@ import SensorDetectionService, { SensorType } from '../../services/SensorDetecti
 import FreeStyleLibreService, { LibreSensorInfo } from '../../services/FreeStyleLibreService';
 import GlucoseMonitoringService from '../../services/GlucoseMonitoringService';
 import MeasurementService from '../../services/MeasurementService';
+import { RootStackParamList } from '../../navigation';
+import { CompositeNavigationProp } from '@react-navigation/native';
+import { TabParamList } from '../../navigation/TabNavigator';
+import { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+// Define a more specific navigation type
+type StartSensorScreenNavigationProp = CompositeNavigationProp<
+  NativeStackNavigationProp<RootStackParamList>,
+  BottomTabNavigationProp<TabParamList>
+>;
 
 // Initialize NFC Manager
 try {
@@ -38,6 +51,9 @@ try {
 } catch (error) {
   console.error('[StartSensorScreen] Error initializing NFC Manager on import:', error);
 }
+
+// Constants for sensor caching
+const SENSOR_CACHE_KEY = 'cgm_current_sensor';
 
 // Interface for sensor data
 interface Sensor {
@@ -55,7 +71,7 @@ interface Sensor {
 
 const StartSensorScreen = () => {
   const { user } = useAuth();
-  const navigation = useNavigation();
+  const navigation = useNavigation<StartSensorScreenNavigationProp>();
   const nfcService = SensorNfcService.getInstance();
   const sensorStatusService = SensorStatusService;
   const glucoseService = GlucoseCalculationService.getInstance();
@@ -90,43 +106,111 @@ const StartSensorScreen = () => {
       
       try {
         console.log('[StartSensorScreen] Fetching current sensor for user:', user.uid);
-        const sensorsRef = collection(db, 'users', user.uid, 'sensors');
-        const q = query(
-          sensorsRef,
-          orderBy('startedAt', 'desc'),
-          limit(1)
-        );
         
-        const querySnapshot = await getDocs(q);
+        // Check if we're online
+        const netInfoState = await NetInfo.fetch();
+        const isOnline = netInfoState.isConnected;
         
-        if (!querySnapshot.empty) {
-          const doc = querySnapshot.docs[0];
-          const data = doc.data();
+        // First try to get from cache to show something immediately
+        try {
+          const cachedSensorData = await AsyncStorage.getItem(`${SENSOR_CACHE_KEY}_${user.uid}`);
+          if (cachedSensorData) {
+            const parsedSensor = JSON.parse(cachedSensorData);
+            console.log('[StartSensorScreen] Using cached sensor data while fetching from Firestore');
+            
+            // Convert string dates back to Date objects
+            const sensor = {
+              ...parsedSensor,
+              startedAt: new Date(parsedSensor.startedAt),
+              expiresAt: new Date(parsedSensor.expiresAt),
+              lastReadingTime: parsedSensor.lastReadingTime ? new Date(parsedSensor.lastReadingTime) : null
+            };
+            
+            // Only set as current if status is active
+            if (sensor.status === 'active') {
+              setCurrentSensor(sensor);
+            }
+          }
+        } catch (cacheError) {
+          console.error('[StartSensorScreen] Error reading cached sensor data:', cacheError);
+        }
+        
+        // If we're online, fetch from Firestore
+        if (isOnline) {
+          const sensorsRef = collection(db, 'users', user.uid, 'sensors');
+          const q = query(
+            sensorsRef,
+            orderBy('startedAt', 'desc'),
+            limit(1)
+          );
           
-          console.log(`[StartSensorScreen] Found sensor document with ID: ${doc.id}, status: ${data.status}`);
+          const querySnapshot = await getDocs(q);
           
-          // Only set as current if status is active
-          if (data.status === 'active') {
-            setCurrentSensor({
-              id: doc.id,
-              serialNumber: data.serialNumber,
-              startedAt: data.startedAt.toDate(),
-              expiresAt: data.expiresAt.toDate(),
-              manufacturer: data.manufacturer,
-              model: data.model,
-              status: data.status,
-              batteryLevel: data.batteryLevel,
-              lastReading: data.lastReading,
-              lastReadingTime: data.lastReadingTime?.toDate(),
-            });
-            console.log(`[StartSensorScreen] Set active sensor with serial: ${data.serialNumber}`);
+          if (!querySnapshot.empty) {
+            const doc = querySnapshot.docs[0];
+            const data = doc.data();
+            
+            console.log(`[StartSensorScreen] Found sensor document with ID: ${doc.id}, status: ${data.status}`);
+            
+            // Only set as current if status is active
+            if (data.status === 'active') {
+              const sensor = {
+                id: doc.id,
+                serialNumber: data.serialNumber,
+                startedAt: data.startedAt.toDate(),
+                expiresAt: data.expiresAt.toDate(),
+                manufacturer: data.manufacturer,
+                model: data.model,
+                status: data.status,
+                batteryLevel: data.batteryLevel,
+                lastReading: data.lastReading,
+                lastReadingTime: data.lastReadingTime?.toDate(),
+              };
+              
+              setCurrentSensor(sensor);
+              
+              // Cache the sensor data for offline use
+              try {
+                // Convert Date objects to strings for storage
+                const sensorToCache = {
+                  ...sensor,
+                  startedAt: sensor.startedAt.toISOString(),
+                  expiresAt: sensor.expiresAt.toISOString(),
+                  lastReadingTime: sensor.lastReadingTime ? sensor.lastReadingTime.toISOString() : null
+                };
+                
+                await AsyncStorage.setItem(
+                  `${SENSOR_CACHE_KEY}_${user.uid}`,
+                  JSON.stringify(sensorToCache)
+                );
+                console.log('[StartSensorScreen] Sensor data cached for offline use');
+              } catch (cacheError) {
+                console.error('[StartSensorScreen] Error caching sensor data:', cacheError);
+              }
+              
+              console.log(`[StartSensorScreen] Set active sensor with serial: ${data.serialNumber}`);
+            } else {
+              console.log(`[StartSensorScreen] Found sensor with status ${data.status}, not setting as current`);
+              // Clear the cache if there's no active sensor
+              try {
+                await AsyncStorage.removeItem(`${SENSOR_CACHE_KEY}_${user.uid}`);
+              } catch (clearError) {
+                console.error('[StartSensorScreen] Error clearing sensor cache:', clearError);
+              }
+            }
           } else {
-            console.log(`[StartSensorScreen] Found sensor with status ${data.status}, not setting as current`);
+            console.log('[StartSensorScreen] No sensor documents found for user');
+            // No active sensor, clear the cache
+            try {
+              await AsyncStorage.removeItem(`${SENSOR_CACHE_KEY}_${user.uid}`);
+            } catch (clearError) {
+              console.error('[StartSensorScreen] Error clearing sensor cache:', clearError);
+            }
+            // No active sensor, but that's okay - just set to null
+            setCurrentSensor(null);
           }
         } else {
-          console.log('[StartSensorScreen] No sensor documents found for user');
-          // No active sensor, but that's okay - just set to null
-          setCurrentSensor(null);
+          console.log('[StartSensorScreen] Device is offline, using cached sensor data only');
         }
       } catch (error: any) {
         console.error('[StartSensorScreen] Error fetching current sensor:', error);
@@ -163,6 +247,15 @@ const StartSensorScreen = () => {
           console.log(`[StartSensorScreen] NFC availability check result: ${isAvailable}`);
           setNfcAvailable(isAvailable);
         }
+        
+        // Explicitly disable foreground dispatch to prevent auto-scanning
+        try {
+          const nfcCoreService = NfcService.getInstance();
+          await nfcCoreService.disableForegroundDispatch();
+          console.log('[StartSensorScreen] Disabled NFC foreground dispatch on initialization');
+        } catch (dispatchError) {
+          console.error('[StartSensorScreen] Error disabling foreground dispatch on init:', dispatchError);
+        }
       } catch (error) {
         console.error('[StartSensorScreen] Failed to initialize NFC:', error);
         if (mounted) {
@@ -184,6 +277,18 @@ const StartSensorScreen = () => {
             console.log(`[StartSensorScreen] NFC availability changed to: ${isAvailable}`);
             setNfcAvailable(isAvailable);
           }
+          
+          // When coming back to foreground, ensure foreground dispatch is disabled
+          // This prevents auto-scanning after returning from settings
+          if (isAvailable) {
+            try {
+              const nfcCoreService = NfcService.getInstance();
+              await nfcCoreService.disableForegroundDispatch();
+              console.log('[StartSensorScreen] Disabled NFC foreground dispatch after app resume');
+            } catch (dispatchError) {
+              console.error('[StartSensorScreen] Error disabling foreground dispatch on resume:', dispatchError);
+            }
+          }
         } catch (error) {
           console.error('[StartSensorScreen] Error during NFC availability check:', error);
         }
@@ -198,6 +303,12 @@ const StartSensorScreen = () => {
       try {
         console.log('[StartSensorScreen] Performing initial NFC cleanup');
         await NfcManager.cancelTechnologyRequest().catch(() => {});
+        
+        // Explicitly disable foreground dispatch on mount
+        const nfcCoreService = NfcService.getInstance();
+        if (nfcCoreService) {
+          await nfcCoreService.disableForegroundDispatch();
+        }
       } catch (error) {
         console.log('[StartSensorScreen] Initial cleanup error (can be ignored):', error);
       }
@@ -227,6 +338,12 @@ const StartSensorScreen = () => {
         console.log('[StartSensorScreen] Cleaning up NFC resources...');
         nfcService.cleanup();
         NfcManager.cancelTechnologyRequest().catch(() => {});
+        
+        // Explicitly disable foreground dispatch on unmount
+        const nfcCoreService = NfcService.getInstance();
+        if (nfcCoreService) {
+          nfcCoreService.disableForegroundDispatch().catch(() => {});
+        }
       } catch (error) {
         console.error('[StartSensorScreen] Error during NFC cleanup:', error);
       }
@@ -276,6 +393,17 @@ const StartSensorScreen = () => {
   const detectSensorType = async () => {
     try {
       setScanning(true);
+      
+      // Get core NFC service and enable foreground dispatch for scanning
+      const nfcCoreService = NfcService.getInstance();
+      try {
+        console.log('[StartSensorScreen] Enabling NFC foreground dispatch for sensor type detection...');
+        await nfcCoreService.enableForegroundDispatch();
+      } catch (dispatchError) {
+        console.error('[StartSensorScreen] Error enabling foreground dispatch for detection:', dispatchError);
+        // Continue anyway
+      }
+      
       const detectedType = await sensorDetectionService.detectSensorType();
       setSensorType(detectedType);
       
@@ -289,9 +417,28 @@ const StartSensorScreen = () => {
       }
       
       setScanning(false);
+      
+      // Disable foreground dispatch after detection
+      try {
+        console.log('[StartSensorScreen] Disabling NFC foreground dispatch after detection...');
+        await nfcCoreService.disableForegroundDispatch();
+      } catch (dispatchError) {
+        console.error('[StartSensorScreen] Error disabling foreground dispatch after detection:', dispatchError);
+      }
+      
       return detectedType;
     } catch (error) {
       console.error('[StartSensorScreen] Error detecting sensor type:', error);
+      
+      // Disable foreground dispatch on error
+      try {
+        const nfcCoreService = NfcService.getInstance();
+        console.log('[StartSensorScreen] Disabling NFC foreground dispatch after detection error...');
+        await nfcCoreService.disableForegroundDispatch();
+      } catch (dispatchError) {
+        console.error('[StartSensorScreen] Error disabling foreground dispatch after error:', dispatchError);
+      }
+      
       setScanning(false);
       Alert.alert('Error', 'Failed to detect sensor type');
       return SensorType.UNKNOWN;
@@ -306,50 +453,124 @@ const StartSensorScreen = () => {
     }
     
     try {
+      // Check if NFC is available before proceeding
+      const isNfcAvailable = await SensorNfcService.isNfcAvailable();
+      
+      if (!isNfcAvailable) {
+        // Prompt the user to enable NFC and offer to redirect to settings
+        Alert.alert(
+          'NFC Required',
+          'NFC is required to scan sensors but it appears to be disabled on your device.',
+          [
+            {
+              text: 'Cancel',
+              style: 'cancel'
+            },
+            {
+              text: 'Open NFC Settings',
+              onPress: async () => {
+                try {
+                  await SensorNfcService.openNfcSettings();
+                } catch (error) {
+                  console.error('[StartSensorScreen] Error opening NFC settings:', error);
+                  Alert.alert('Error', 'Could not open NFC settings. Please enable NFC manually in your device settings.');
+                }
+              }
+            }
+          ]
+        );
+        return;
+      }
+      
       setScanning(true);
-      setShowScanGuide(true); // Show the scan guide
+      setShowScanGuide(true); // Keep showing the scan guide
+      nfcOperationInProgress.current = true;
       
-      // Detect sensor type first
-      const detectedType = await sensorDetectionService.detectSensorType();
-      setSensorType(detectedType);
+      // Get core NFC service and enable foreground dispatch for scanning
+      const nfcCoreService = NfcService.getInstance();
+      try {
+        console.log('[StartSensorScreen] Enabling NFC foreground dispatch for scanning...');
+        await nfcCoreService.enableForegroundDispatch();
+      } catch (dispatchError) {
+        console.error('[StartSensorScreen] Error enabling foreground dispatch:', dispatchError);
+        // Continue anyway
+      }
       
-      // Hide scan guide as soon as sensor is detected
-      setShowScanGuide(false);
+      // Create a promise that will be rejected after 20 seconds
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => {
+          reject(new Error('TIMEOUT'));
+        }, 20000); // 20 second timeout - gives more time to read sensor
+      });
       
-      // Update monitoring service with detected sensor type
-      monitoringService.setSensorType(detectedType);
-      
-      if (detectedType === SensorType.LIBRE) {
-        // Handle FreeStyle Libre sensor
-        const sensorInfo = await libreService.readSensorInfo();
+      try {
+        // Detect sensor type with extended timeout
+        const sensorDetectionPromise = sensorDetectionService.detectSensorType();
+        const detectedType = await Promise.race([sensorDetectionPromise, timeoutPromise]) as SensorType;
         
-        if (sensorInfo) {
-          setLibreSensorInfo(sensorInfo);
+        // Hide scan guide as soon as sensor is detected
+        setShowScanGuide(false);
+        setSensorType(detectedType);
+        
+        // Update monitoring service with detected sensor type
+        monitoringService.setSensorType(detectedType);
+        
+        if (detectedType === SensorType.LIBRE) {
+          // Handle FreeStyle Libre sensor with extended timeout
+          try {
+            const sensorInfoPromise = libreService.readSensorInfo();
+            const sensorInfo = await Promise.race([sensorInfoPromise, timeoutPromise]) as LibreSensorInfo;
+            
+            if (sensorInfo) {
+              setLibreSensorInfo(sensorInfo);
+              
+              // Activate Libre sensor
+              await activateLibreSensor(
+                sensorInfo.serialNumber,
+                sensorInfo.sensorType,
+                'Abbott'
+              );
+            } else {
+              Alert.alert('Error', 'Could not read FreeStyle Libre sensor information. Try again and hold your phone still during the entire process.');
+            }
+          } catch (libreError: unknown) {
+            // Specific error handling for Libre sensors
+            if ((libreError as Error).message === 'TIMEOUT') {
+              Alert.alert(
+                'Sensor Read Timeout', 
+                'Reading the FreeStyle Libre sensor took too long. Make sure you hold your phone still during the entire scan process.'
+              );
+            } else {
+              throw libreError; // Re-throw for outer catch
+            }
+          }
+        } else if (detectedType === SensorType.RF430) {
+          // Continue with existing RF430 sensor handling
+          const sensorInfo = await nfcService.readSensorInfo();
+          if (!sensorInfo) {
+            throw new Error('Failed to read sensor information');
+          }
           
-          // Activate Libre sensor
-          await activateLibreSensor(
-            sensorInfo.serialNumber,
-            sensorInfo.sensorType,
-            'Abbott'
+          // Activate RF430 sensor (existing code)
+          await activateSensor(
+            sensorInfo.serialNumber || 'unknown',
+            sensorInfo.sensorType || 'RF430FRL15xH',
+            'Custom'
           );
         } else {
-          Alert.alert('Error', 'Could not read FreeStyle Libre sensor information');
+          Alert.alert('Unknown Sensor', 'Could not identify sensor type');
         }
-      } else if (detectedType === SensorType.RF430) {
-        // Continue with existing RF430 sensor handling
-        const sensorInfo = await nfcService.readSensorInfo();
-        if (!sensorInfo) {
-          throw new Error('Failed to read sensor information');
+      } catch (scanError: unknown) {
+        // Handle timeout or other errors during sensor detection
+        if ((scanError as Error).message === 'TIMEOUT') {
+          Alert.alert(
+            'Scan Timeout', 
+            'The scan took too long to complete. Please make sure your sensor is near your phone and try again.'
+          );
+        } else {
+          // Re-throw for outer catch block
+          throw scanError;
         }
-        
-        // Activate RF430 sensor (existing code)
-        await activateSensor(
-          sensorInfo.serialNumber || 'unknown',
-          sensorInfo.sensorType || 'RF430FRL15xH',
-          'Custom'
-        );
-      } else {
-        Alert.alert('Unknown Sensor', 'Could not identify sensor type');
       }
     } catch (error) {
       console.error('[StartSensorScreen] Error scanning sensor:', error);
@@ -361,9 +582,28 @@ const StartSensorScreen = () => {
         if (error.message.includes('TAG_NOT_FOUND')) {
           errorMessage = 'No sensor found. Please try again and make sure the sensor is close to your device.';
         } else if (error.message.includes('TIMEOUT')) {
-          errorMessage = 'Scan timed out. Please try again.';
+          errorMessage = 'Scan timed out. Please try again and hold your phone still during the scan.';
         } else if (error.message.includes('CANCELLED')) {
           errorMessage = 'Scan was cancelled.';
+        } else if (error.message.includes('you should requestTagEvent first')) {
+          errorMessage = 'NFC scan issue. Please try again and keep your phone still near the sensor for the entire scan process.';
+        } else if (error.message.includes('NFC_NOT_ENABLED') || error.message.includes('NFC is not enabled')) {
+          // Handle case when NFC was initially enabled but disabled during the process
+          Alert.alert(
+            'NFC Disabled',
+            'NFC appears to have been disabled. Do you want to open NFC settings?',
+            [
+              {
+                text: 'Cancel',
+                style: 'cancel'
+              },
+              {
+                text: 'Open Settings',
+                onPress: () => SensorNfcService.openNfcSettings()
+              }
+            ]
+          );
+          return;
         } else {
           errorMessage = `Error: ${error.message}`;
         }
@@ -373,7 +613,18 @@ const StartSensorScreen = () => {
     } finally {
       setScanning(false);
       setShowScanGuide(false); // Ensure scan guide is hidden
+      
+      // Explicitly disable foreground dispatch after scanning
+      try {
+        const nfcCoreService = NfcService.getInstance();
+        console.log('[StartSensorScreen] Disabling NFC foreground dispatch after scanning...');
+        await nfcCoreService.disableForegroundDispatch();
+      } catch (dispatchError) {
+        console.error('[StartSensorScreen] Error disabling foreground dispatch:', dispatchError);
+      }
+      
       await ensureNfcCleanup();
+      nfcOperationInProgress.current = false;
     }
   };
   
@@ -412,7 +663,7 @@ const StartSensorScreen = () => {
     setScanning(false);
   };
   
-  // Activate a new sensor
+  // Update activateSensor to ensure readings are saved correctly
   const activateSensor = async (serialNumber: string, manufacturer: string, model: string) => {
     if (!user) return;
     
@@ -444,7 +695,7 @@ const StartSensorScreen = () => {
         expiresAt,
         manufacturer,
         model,
-        status: 'active',
+        status: 'active' as const,
         createdAt: serverTimestamp(),
         lastReading: sensorTestResult?.reading || null,
         lastReadingTime: sensorTestResult?.success ? now : null,
@@ -466,7 +717,7 @@ const StartSensorScreen = () => {
         expirationDate: expiresAt,
         manufacturer,
         model,
-        status: 'active',
+        status: 'active' as const,
         lastScanTime: now,
         batteryLevel: 100,
         lastReading: sensorTestResult?.reading || null,
@@ -488,19 +739,41 @@ const StartSensorScreen = () => {
         // We can still proceed since the user-specific sensor was added
       }
       
-      // Update state
-      setCurrentSensor({
+      // Create the sensor object for state and caching
+      const sensorForState = {
         id: docRef.id,
         serialNumber,
         startedAt: now,
         expiresAt,
         manufacturer,
         model,
-        status: 'active',
+        status: 'active' as const,
         lastReading: sensorTestResult?.reading || null,
         lastReadingTime: sensorTestResult?.success ? now : null,
         batteryLevel: 100,
-      });
+      };
+      
+      // Update state
+      setCurrentSensor(sensorForState);
+      
+      // Cache the sensor data for offline use
+      try {
+        // Convert Date objects to strings for storage
+        const sensorToCache = {
+          ...sensorForState,
+          startedAt: sensorForState.startedAt.toISOString(),
+          expiresAt: sensorForState.expiresAt.toISOString(),
+          lastReadingTime: sensorForState.lastReadingTime ? sensorForState.lastReadingTime.toISOString() : null
+        };
+        
+        await AsyncStorage.setItem(
+          `${SENSOR_CACHE_KEY}_${user.uid}`,
+          JSON.stringify(sensorToCache)
+        );
+        console.log('[StartSensorScreen] New sensor data cached for offline use');
+      } catch (cacheError) {
+        console.error('[StartSensorScreen] Error caching new sensor data:', cacheError);
+      }
       
       try {
         // Update sensor status service
@@ -519,8 +792,8 @@ const StartSensorScreen = () => {
           {
             text: 'OK',
             onPress: () => {
-              // Optionally navigate to home screen
-              // navigation.navigate('Home');
+              // Navigate to home screen to see the reading
+              navigation.navigate('MainApp');
             }
           }
         ]
@@ -575,6 +848,14 @@ const StartSensorScreen = () => {
         }
       }
       
+      // Clear cache since sensor is now inactive
+      try {
+        await AsyncStorage.removeItem(`${SENSOR_CACHE_KEY}_${user.uid}`);
+        console.log('[StartSensorScreen] Sensor cache cleared after deactivation');
+      } catch (cacheError) {
+        console.error('[StartSensorScreen] Error clearing sensor cache:', cacheError);
+      }
+      
       // Clear current sensor state
       setCurrentSensor(null);
     } catch (error) {
@@ -617,60 +898,150 @@ const StartSensorScreen = () => {
   
   // Add a function to run the diagnostic test
   const runDiagnosticTest = async () => {
-    if (runningDiagnostic) return;
-    
-    setRunningDiagnostic(true);
-    setDiagnosticResult(null);
+    // Don't run if another operation is in progress
+    if (scanning || processing || runningDiagnostic) {
+      return;
+    }
     
     try {
-      console.log('[StartSensorScreen] Starting sensor diagnostic test...');
+      // Check if NFC is available before proceeding
+      const isNfcAvailable = await SensorNfcService.isNfcAvailable();
       
-      // Ensure NFC is initialized and available
-      let isNfcAvailable = false;
-      try {
-        console.log('[StartSensorScreen] Checking NFC availability for diagnostic');
-        isNfcAvailable = await SensorNfcService.isNfcAvailable();
-        
-        if (!isNfcAvailable) {
-          setDiagnosticResult({
-            success: false,
-            message: 'NFC is not available. Please enable NFC in your device settings.'
-          });
-          return;
-        }
-      } catch (error) {
-        console.error('[StartSensorScreen] Error checking NFC for diagnostic:', error);
-        setDiagnosticResult({
-          success: false,
-          message: 'Error checking NFC status: ' + (error instanceof Error ? error.message : String(error))
-        });
+      if (!isNfcAvailable) {
+        // Prompt the user to enable NFC and offer to redirect to settings
+        Alert.alert(
+          'NFC Required',
+          'NFC is required to test sensor communication but it appears to be disabled on your device.',
+          [
+            {
+              text: 'Cancel',
+              style: 'cancel'
+            },
+            {
+              text: 'Open NFC Settings',
+              onPress: async () => {
+                try {
+                  await SensorNfcService.openNfcSettings();
+                } catch (error) {
+                  console.error('[StartSensorScreen] Error opening NFC settings:', error);
+                  Alert.alert('Error', 'Could not open NFC settings. Please enable NFC manually in your device settings.');
+                }
+              }
+            }
+          ]
+        );
         return;
       }
       
-      // Run the diagnostic test
-      const result = await nfcService.diagnosticTest();
+      setRunningDiagnostic(true);
+      setDiagnosticResult(null);
       
-      if (result) {
-        console.log('[StartSensorScreen] Diagnostic test passed!');
-        setDiagnosticResult({
-          success: true,
-          message: 'Sensor communication test PASSED! The sensor can be read from.'
-        });
-      } else {
-        console.log('[StartSensorScreen] Diagnostic test failed');
+      // Get core NFC service and enable foreground dispatch for scanning
+      const nfcCoreService = NfcService.getInstance();
+      try {
+        console.log('[StartSensorScreen] Enabling NFC foreground dispatch for diagnostic...');
+        await nfcCoreService.enableForegroundDispatch();
+      } catch (dispatchError) {
+        console.error('[StartSensorScreen] Error enabling foreground dispatch for diagnostic:', dispatchError);
+        // Continue anyway
+      }
+      
+      try {
+        // First check sensor type if we need to
+        let currentSensorType = sensorType;
+        if (currentSensorType === SensorType.UNKNOWN) {
+          console.log('[StartSensorScreen] Detecting sensor type for diagnostic test...');
+          setShowScanGuide(true);
+          currentSensorType = await sensorDetectionService.detectSensorType();
+          setSensorType(currentSensorType);
+          setShowScanGuide(false);
+        }
+        
+        console.log(`[StartSensorScreen] Running diagnostic with sensor type: ${currentSensorType}`);
+        
+        if (currentSensorType === SensorType.LIBRE) {
+          // For Libre sensors
+          setShowScanGuide(true);
+          // Use detectLibreSensor which is available in FreeStyleLibreService
+          const success = await libreService.detectLibreSensor();
+          setShowScanGuide(false);
+          
+          if (success) {
+            setDiagnosticResult({
+              success: true,
+              message: 'Successfully communicated with your FreeStyle Libre sensor!'
+            });
+          } else {
+            setDiagnosticResult({
+              success: false,
+              message: 'Could not establish communication with the FreeStyle Libre sensor. Make sure it is properly applied and try again.'
+            });
+          }
+        } else {
+          // For RF430 sensors
+          setShowScanGuide(true);
+          const success = await nfcService.diagnosticTest();
+          setShowScanGuide(false);
+          
+          if (success) {
+            setDiagnosticResult({
+              success: true,
+              message: 'Successfully communicated with your sensor!'
+            });
+          } else {
+            setDiagnosticResult({
+              success: false,
+              message: 'Could not establish communication with the sensor. Make sure it is properly applied and try again.'
+            });
+          }
+        }
+      } catch (error) {
+        console.error('[StartSensorScreen] Diagnostic test error:', error);
         setDiagnosticResult({
           success: false,
-          message: 'Sensor communication test FAILED. Please check the logs for details.'
+          message: `Diagnostic failed: ${error instanceof Error ? error.message : 'Unknown error'}`
         });
+      } finally {
+        // Ensure scan guide is hidden if still visible
+        setShowScanGuide(false);
+        
+        // Explicitly disable foreground dispatch after diagnostic
+        try {
+          const nfcCoreService = NfcService.getInstance();
+          console.log('[StartSensorScreen] Disabling NFC foreground dispatch after diagnostic...');
+          await nfcCoreService.disableForegroundDispatch();
+        } catch (dispatchError) {
+          console.error('[StartSensorScreen] Error disabling foreground dispatch after diagnostic:', dispatchError);
+        }
       }
     } catch (error) {
       console.error('[StartSensorScreen] Error in diagnostic test:', error);
-      setDiagnosticResult({
-        success: false,
-        message: 'Error running diagnostic: ' + (error instanceof Error ? error.message : String(error))
-      });
+      
+      if (error instanceof Error && (error.message.includes('NFC_NOT_ENABLED') || error.message.includes('NFC is not enabled'))) {
+        // Handle case when NFC was initially enabled but disabled during the process
+        Alert.alert(
+          'NFC Disabled',
+          'NFC appears to have been disabled. Do you want to open NFC settings?',
+          [
+            {
+              text: 'Cancel',
+              style: 'cancel'
+            },
+            {
+              text: 'Open Settings',
+              onPress: () => SensorNfcService.openNfcSettings()
+            }
+          ]
+        );
+      } else {
+        setDiagnosticResult({
+          success: false,
+          message: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`
+        });
+      }
     } finally {
       setRunningDiagnostic(false);
+      await ensureNfcCleanup();
     }
   };
   
@@ -691,7 +1062,7 @@ const StartSensorScreen = () => {
         expiresAt,
         manufacturer,
         model,
-        status: 'active',
+        status: 'active' as const,
         batteryLevel: 100, // Libre doesn't report battery level
         lastReading: null,
         lastReadingTime: null
@@ -702,11 +1073,47 @@ const StartSensorScreen = () => {
         try {
           console.log(`[StartSensorScreen] Storing FreeStyle Libre sensor data for user: ${user.uid}`);
           const sensorsRef = collection(db, 'users', user.uid, 'sensors');
-          await addDoc(sensorsRef, {
+          const docRef = await addDoc(sensorsRef, {
             ...sensorData,
             startedAt: serverTimestamp(),
             expiresAt: new Date(expiresAt),
           });
+          
+          // Create the sensor object for state and caching
+          const sensorForState = {
+            id: docRef.id,
+            serialNumber,
+            startedAt,
+            expiresAt,
+            manufacturer,
+            model,
+            status: 'active' as const,
+            batteryLevel: 100,
+            lastReading: null,
+            lastReadingTime: null
+          };
+          
+          // Update state
+          setCurrentSensor(sensorForState);
+          
+          // Cache the sensor data for offline use
+          try {
+            // Convert Date objects to strings for storage
+            const sensorToCache = {
+              ...sensorForState,
+              startedAt: sensorForState.startedAt.toISOString(),
+              expiresAt: sensorForState.expiresAt.toISOString(),
+              lastReadingTime: null
+            };
+            
+            await AsyncStorage.setItem(
+              `${SENSOR_CACHE_KEY}_${user.uid}`,
+              JSON.stringify(sensorToCache)
+            );
+            console.log('[StartSensorScreen] New Libre sensor data cached for offline use');
+          } catch (cacheError) {
+            console.error('[StartSensorScreen] Error caching new Libre sensor data:', cacheError);
+          }
           
           console.log('[StartSensorScreen] FreeStyle Libre sensor data stored successfully');
         } catch (error) {
@@ -715,34 +1122,99 @@ const StartSensorScreen = () => {
         }
       }
       
-      // Test reading
-      await verifyLibreSensor();
+      // Test reading - this will handle enabling/disabling foreground dispatch internally
+      const readingSuccess = await verifyLibreSensor();
+      
+      // Make sure foreground dispatch is disabled regardless of verifyLibreSensor's internal handling
+      try {
+        const nfcCoreService = NfcService.getInstance();
+        console.log('[StartSensorScreen] Ensuring NFC foreground dispatch is disabled after activation...');
+        await nfcCoreService.disableForegroundDispatch();
+      } catch (dispatchError) {
+        console.error('[StartSensorScreen] Error disabling foreground dispatch after activation:', dispatchError);
+      }
       
       // Success
-      Alert.alert('Success', 'FreeStyle Libre sensor activated successfully');
-      navigation.goBack();
+      Alert.alert('Success', 'FreeStyle Libre sensor activated successfully', [
+        { 
+          text: 'OK', 
+          onPress: () => {
+            // Navigate directly to the Home screen to show the new reading
+            navigation.navigate('MainApp');
+          }
+        }
+      ]);
     } catch (error) {
       console.error('[StartSensorScreen] Error activating Libre sensor:', error);
+      
+      // Make sure foreground dispatch is disabled on error
+      try {
+        const nfcCoreService = NfcService.getInstance();
+        console.log('[StartSensorScreen] Ensuring NFC foreground dispatch is disabled after activation error...');
+        await nfcCoreService.disableForegroundDispatch();
+      } catch (dispatchError) {
+        console.error('[StartSensorScreen] Error disabling foreground dispatch after error:', dispatchError);
+      }
+      
       Alert.alert('Error', 'Failed to activate FreeStyle Libre sensor');
     } finally {
       setProcessing(false);
     }
   };
   
-  // Add method to verify Libre sensor
+  // Update verifyLibreSensor to reliably save the first reading
   const verifyLibreSensor = async () => {
     try {
       setVerifyingSensor(true);
       
+      // Enable foreground dispatch explicitly for verification
+      try {
+        const nfcCoreService = NfcService.getInstance();
+        console.log('[StartSensorScreen] Enabling NFC foreground dispatch for sensor verification...');
+        await nfcCoreService.enableForegroundDispatch();
+      } catch (dispatchError) {
+        console.error('[StartSensorScreen] Error enabling foreground dispatch for verification:', dispatchError);
+        // Continue anyway
+      }
+      
       // Take a test reading
       const reading = await libreService.readGlucoseData();
+      
+      // Disable foreground dispatch after reading
+      try {
+        const nfcCoreService = NfcService.getInstance();
+        console.log('[StartSensorScreen] Disabling NFC foreground dispatch after verification...');
+        await nfcCoreService.disableForegroundDispatch();
+      } catch (dispatchError) {
+        console.error('[StartSensorScreen] Error disabling foreground dispatch after verification:', dispatchError);
+      }
       
       // Save the reading to Firebase if user is logged in
       if (user) {
         try {
           console.log(`[StartSensorScreen] Saving initial Libre sensor reading (${reading.value} mg/dL) to Firebase`);
-          await MeasurementService.addReading(user.uid, reading);
-          console.log('[StartSensorScreen] Initial reading saved successfully');
+          
+          // Make sure our reading has a timestamp that's guaranteed to be unique
+          // This helps avoid duplicate detection issues
+          const uniqueTimestamp = new Date();
+          const uniqueReading = {
+            ...reading,
+            timestamp: uniqueTimestamp,
+            isSensorActivationReading: true // Special flag to bypass duplicate detection
+          };
+          
+          const readingId = await MeasurementService.addReading(user.uid, uniqueReading);
+          
+          // Create full reading with ID
+          const fullReading = {
+            ...reading,
+            id: readingId
+          };
+          
+          // Update the monitoring service's last reading
+          monitoringService.setLastReading(fullReading);
+          
+          console.log('[StartSensorScreen] Initial reading saved successfully with ID:', readingId);
         } catch (error) {
           console.error('[StartSensorScreen] Error saving initial reading:', error);
           // Continue anyway - we still consider sensor verification successful
@@ -757,6 +1229,16 @@ const StartSensorScreen = () => {
       return true;
     } catch (error) {
       console.error('[StartSensorScreen] Error verifying Libre sensor:', error);
+      
+      // Disable foreground dispatch on error
+      try {
+        const nfcCoreService = NfcService.getInstance();
+        console.log('[StartSensorScreen] Disabling NFC foreground dispatch after verification error...');
+        await nfcCoreService.disableForegroundDispatch();
+      } catch (dispatchError) {
+        console.error('[StartSensorScreen] Error disabling foreground dispatch after error:', dispatchError);
+      }
+      
       setSensorTestResult({
         success: false,
         reading: null,
@@ -833,8 +1315,11 @@ const StartSensorScreen = () => {
     <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle="dark-content" />
       <ScrollView contentContainerStyle={styles.scrollContent}>
-        {/* Add sensor type selection at the top */}
-        {renderSensorTypeSelection()}
+        {/* Only show sensor type selection when there's no active sensor */}
+        {!currentSensor && renderSensorTypeSelection()}
+        
+        {/* Only show Libre sensor info when there's no active sensor */}
+        {!currentSensor && renderLibreSensorInfo()}
         
         {/* Current Sensor Info */}
         <View style={styles.sectionContainer}>

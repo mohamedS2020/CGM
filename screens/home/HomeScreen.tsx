@@ -14,6 +14,7 @@ import {
   Linking,
   Switch
 } from 'react-native';
+import NetInfo from '@react-native-community/netinfo';
 import { useAuth } from '../../context/AuthContext';
 import { db } from '../../firebase';
 import { LineChart } from 'react-native-chart-kit';
@@ -23,6 +24,7 @@ import SensorNfcService, { NfcErrorType } from '../../services/SensorNfcService'
 import GlucoseCalculationService from '../../services/GlucoseCalculationService';
 import GlucoseMonitoringService from '../../services/GlucoseMonitoringService';
 import NfcService from '../../services/NfcService';
+import GlucoseReadingEvents from '../../services/GlucoseReadingEvents';
 
 // Custom Tooltip component
 interface TooltipProps {
@@ -110,11 +112,36 @@ const HomeScreen = () => {
   // References
   const appStateRef = useRef(AppState.currentState);
   const nfcCheckIntervalRef = useRef<number | null>(null);
+  const initialSyncCompletedRef = useRef(false);
+  const isMountedRef = useRef(true);
   
   // Get service instances
   const nfcService = SensorNfcService.getInstance();
   const glucoseCalculationService = GlucoseCalculationService.getInstance();
   const monitoringService = GlucoseMonitoringService.getInstance();
+
+  // Add ref to track NFC operations
+  const nfcOperationInProgress = useRef(false);
+  
+  // Function to ensure NFC is cleaned up
+  const ensureNfcCleanup = async () => {
+    try {
+      console.log('[HomeScreen] Ensuring NFC resources are cleaned up');
+      const nfcCoreService = NfcService.getInstance();
+      await nfcCoreService.forceCancelTechnologyRequest();
+      nfcCoreService.setOperationInProgress(false);
+      
+      if (nfcService) {
+        await nfcService.cleanup();
+      }
+      
+      nfcOperationInProgress.current = false;
+    } catch (error) {
+      console.error('[HomeScreen] Error during NFC cleanup:', error);
+      // Still mark as not in progress even if cleanup fails
+      nfcOperationInProgress.current = false;
+    }
+  };
 
   // Fetch glucose readings
   const fetchGlucoseReadings = async () => {
@@ -123,45 +150,104 @@ const HomeScreen = () => {
     try {
       setLoading(true);
       
-      // Get latest reading first to show as current value
-      const latestReading = await MeasurementService.getLatestReading(user.uid);
+      // Check if we're online
+      const netInfoState = await NetInfo.fetch();
+      const isOnline = netInfoState.isConnected;
       
-      // If we have a latest reading, make sure it's displayed
-      if (latestReading) {
-        setLastReading(latestReading);
+      // Set a timeout to prevent loading indefinitely
+      const loadingTimeout = setTimeout(() => {
+        console.log('Loading timeout reached, stopping loading state');
+        setLoading(false);
+      }, 5000); // 5 second timeout
+      
+      // Get latest reading first to show as current value
+      const latestReadingPromise = MeasurementService.getLatestReading(user.uid);
+      
+      // Use Promise.race to implement a timeout for the fetch
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('FETCH_TIMEOUT')), 7000);
+      });
+      
+      try {
+        const latestReading = await Promise.race([latestReadingPromise, timeoutPromise]) as GlucoseReading;
+        
+        // If we have a latest reading, make sure it's displayed
+        if (latestReading) {
+          setLastReading(latestReading);
+        }
+      } catch (fetchError) {
+        if (fetchError instanceof Error && fetchError.message === 'FETCH_TIMEOUT') {
+          console.log('Fetching latest reading timed out');
+        } else {
+          console.error('Error fetching latest reading:', fetchError);
+        }
       }
       
       // Fetch readings based on the selected timeframe
       let readings: GlucoseReading[] = [];
       
-      switch (chartTimeframe) {
-        case 'hour':
-          readings = await MeasurementService.getHourlyReadings(user.uid);
-          break;
-        case 'day':
-          readings = await MeasurementService.getDailyReadings(user.uid);
-          break;
-        case 'week':
-          readings = await MeasurementService.getWeeklyReadings(user.uid);
-          break;
+      try {
+        switch (chartTimeframe) {
+          case 'hour':
+            readings = await Promise.race([
+              MeasurementService.getHourlyReadings(user.uid),
+              timeoutPromise
+            ]) as GlucoseReading[];
+            break;
+          case 'day':
+            readings = await Promise.race([
+              MeasurementService.getDailyReadings(user.uid),
+              timeoutPromise
+            ]) as GlucoseReading[];
+            break;
+          case 'week':
+            readings = await Promise.race([
+              MeasurementService.getWeeklyReadings(user.uid),
+              timeoutPromise
+            ]) as GlucoseReading[];
+            break;
+        }
+      } catch (fetchError) {
+        if (fetchError instanceof Error && fetchError.message === 'FETCH_TIMEOUT') {
+          console.log(`Fetching ${chartTimeframe} readings timed out`);
+        } else {
+          console.error(`Error fetching ${chartTimeframe} readings:`, fetchError);
+        }
+        
+        // If we're offline, try to get offline readings directly
+        if (!isOnline) {
+          try {
+            console.log('Offline mode: Getting locally stored readings');
+            readings = await MeasurementService.getReadings(user.uid, { 
+              timeframe: chartTimeframe,
+              limit: 50
+            });
+          } catch (offlineError) {
+            console.error('Error fetching offline readings:', offlineError);
+          }
+        }
       }
       
       // If we're in hour view and have a latest reading but no historical readings,
       // add the latest reading to the chart data
-      if (chartTimeframe === 'hour' && readings.length === 0 && latestReading) {
-        readings = [latestReading];
+      if (chartTimeframe === 'hour' && readings.length === 0 && lastReading) {
+        readings = [lastReading];
       }
       
       setGlucoseReadings(readings);
       
-      // If no readings at all, create mock data for testing
-      if (!latestReading && readings.length === 0) {
-        // Not using mock data anymore as we're using real sensor data
-        console.log('No readings found. Please scan a sensor to get real readings.');
+      // Log the state
+      if (!isOnline) {
+        console.log('Device is offline, using cached data');
       }
+      
+      // Clear the loading timeout since we're done
+      clearTimeout(loadingTimeout);
     } catch (error) {
       console.error('Error fetching glucose readings:', error);
-      Alert.alert('Error', 'Failed to fetch glucose readings');
+      if (!__DEV__) { // Only show in production
+        Alert.alert('Error', 'Failed to fetch glucose readings');
+      }
     } finally {
       setLoading(false);
     }
@@ -175,16 +261,68 @@ const HomeScreen = () => {
       return;
     }
     
+    // Get the NFC core service for enabling/disabling foreground dispatch
+    const nfcCoreService = NfcService.getInstance();
+    
+    // Force cleanup NFC system regardless of state before starting new scan
+    try {
+      console.log('[HomeScreen] Force cleaning up NFC system before new scan...');
+      
+      // Force cancel any technology request that might be hanging
+      await nfcCoreService.forceCancelTechnologyRequest();
+      
+      // Reset operation in progress flags
+      nfcCoreService.setOperationInProgress(false);
+      nfcOperationInProgress.current = false;
+      
+      // Reset the NFC system
+      await nfcCoreService.resetNfcSystem();
+      
+      // Clean up sensor service
+      if (nfcService) {
+        await nfcService.cleanup();
+      }
+      
+      console.log('[HomeScreen] NFC system reset complete');
+    } catch (cleanupError) {
+      console.error('[HomeScreen] Error resetting NFC system:', cleanupError);
+      // Continue anyway, as we'll attempt the scan
+    }
+    
+    // Check if NFC operation is already in progress
+    if (nfcOperationInProgress.current) {
+      console.log('[HomeScreen] Attempting to scan while NFC operation is already in progress');
+      Alert.alert(
+        'NFC Busy',
+        'Another NFC operation is in progress. Please wait a moment and try again.',
+        [{ 
+          text: 'Reset NFC', 
+          onPress: async () => {
+            try {
+              await ensureNfcCleanup();
+              Alert.alert('NFC Reset', 'The NFC system has been reset. Please try scanning again.');
+            } catch (error) {
+              console.error('[HomeScreen] Error resetting NFC:', error);
+            }
+          }
+        }, { 
+          text: 'Cancel' 
+        }]
+      );
+      return;
+    }
+    
     try {
       setScanning(true);
+      nfcOperationInProgress.current = true;
       
       // First check if NFC is available
       let isNfcAvailable = false;
       try {
         isNfcAvailable = await SensorNfcService.isNfcAvailable();
-        console.log('Current NFC availability status:', isNfcAvailable);
+        console.log('[HomeScreen] Current NFC availability status:', isNfcAvailable);
       } catch (error) {
-        console.error('Error checking NFC availability:', error);
+        console.error('[HomeScreen] Error checking NFC availability:', error);
       }
       
       if (!isNfcAvailable) {
@@ -208,6 +346,7 @@ const HomeScreen = () => {
             [{ text: 'OK' }]
           );
           setScanning(false);
+          nfcOperationInProgress.current = false;
           return;
         }
         
@@ -253,15 +392,16 @@ const HomeScreen = () => {
           Alert.alert('NFC Not Available', 'Your device does not appear to support NFC, which is required for this feature.');
         }
         setScanning(false);
+        nfcOperationInProgress.current = false;
         return;
       }
       
       // Check if NFC service is already performing an operation
       let isNfcBusy = false;
       try {
-        const nfcCoreService = NfcService.getInstance();
         if (nfcCoreService && typeof nfcCoreService.isOperationInProgress === 'function') {
-          isNfcBusy = nfcCoreService.isOperationInProgress();
+          // Use resetIfStuck=true to attempt recovery if an operation appears to be stuck
+          isNfcBusy = nfcCoreService.isOperationInProgress(true);
         }
       } catch (error) {
         console.error('Error checking NFC service status:', error);
@@ -271,10 +411,34 @@ const HomeScreen = () => {
         Alert.alert(
           'NFC Busy',
           'Another NFC operation is in progress. Please wait a moment and try again.',
-          [{ text: 'OK' }]
+          [{ 
+            text: 'Reset NFC', 
+            onPress: async () => {
+              try {
+                // Try to reset the NFC system
+                await nfcCoreService.resetNfcSystem();
+                Alert.alert('NFC Reset', 'The NFC system has been reset. Please try scanning again.');
+              } catch (error) {
+                console.error('Error resetting NFC:', error);
+              }
+            }
+          }, { 
+            text: 'Cancel' 
+          }]
         );
         setScanning(false);
+        nfcOperationInProgress.current = false;
         return;
+      }
+      
+      // IMPORTANT: Explicitly enable NFC foreground dispatch right before scanning
+      // This prevents automatic tag reading when not explicitly requested
+      try {
+        console.log('[HomeScreen] Enabling NFC foreground dispatch for manual scan...');
+        await nfcCoreService.enableForegroundDispatch();
+      } catch (dispatchError) {
+        console.error('[HomeScreen] Error enabling foreground dispatch:', dispatchError);
+        // Continue anyway
       }
       
       // Try to take a manual reading using the monitoring service
@@ -292,9 +456,11 @@ const HomeScreen = () => {
           }
           
           // Take a manual reading
-          const reading = await monitoringService.takeManualReading();
+          const reading = await monitoringService.takeManualReading(user.uid);
           
-          // Update state with new reading (handleNewReading will be called by the service)
+          // Directly update state with new reading for immediate UI update
+          setLastReading(reading);
+          setGlucoseReadings(prevReadings => [reading, ...prevReadings]);
           
           // Show success message
           Alert.alert(
@@ -303,7 +469,7 @@ const HomeScreen = () => {
             [{ text: 'OK' }]
           );
         } catch (error) {
-          console.error('Error taking manual reading:', error);
+          console.error('[HomeScreen] Error taking manual reading:', error);
           
           if (error instanceof Error) {
             // Handle specific error messages
@@ -314,29 +480,30 @@ const HomeScreen = () => {
               Alert.alert(
                 'NFC Busy',
                 'Another NFC operation is in progress. Please wait a moment and try again.',
-                [{ text: 'OK' }]
+                [{ 
+                  text: 'Reset NFC', 
+                  onPress: async () => {
+                    try {
+                      await ensureNfcCleanup();
+                      Alert.alert('NFC Reset', 'The NFC system has been reset. Please try scanning again.');
+                    } catch (error) {
+                      console.error('[HomeScreen] Error resetting NFC:', error);
+                    }
+                  }
+                }, { 
+                  text: 'Cancel' 
+                }]
               );
             } else if (errorMessage.includes('NOT_SUPPORTED')) {
               Alert.alert(
                 'NFC Not Supported', 
                 'It appears your device does not support NFC or it is currently disabled.'
               );
-            } else if (errorMessage.includes('TAG_NOT_FOUND')) {
+            } else if (errorMessage.includes('TAG_NOT_FOUND') || errorMessage.includes('No card found')) {
               Alert.alert(
                 'Sensor Not Found', 
                 'No glucose sensor was detected. Place your CGM sensor directly against the back of your phone and try again.',
-                [{ 
-                  text: 'OK',
-                  onPress: () => {
-                    Alert.alert(
-                      'Testing Mode',
-                      'Are you running this app in testing mode without a physical sensor? In a production environment, a compatible glucose sensor is required.',
-                      [
-                        { text: 'I Understand', style: 'default' }
-                      ]
-                    );
-                  } 
-                }]
+                [{ text: 'OK' }]
               );
             } else if (errorMessage.includes('TIMEOUT')) {
               Alert.alert(
@@ -347,7 +514,14 @@ const HomeScreen = () => {
             } else if (errorMessage.includes('COMMUNICATION_ERROR')) {
               Alert.alert(
                 'Communication Error',
-                'Unable to read from sensor. This error is common when no sensor is present or the sensor is not positioned correctly.',
+                'Unable to read from sensor. Please make sure your sensor is properly positioned.',
+                [{ text: 'OK' }]
+              );
+            } else if (errorMessage.includes('ALREADY_ACTIVE') || errorMessage.includes('SENSOR_ALREADY_ACTIVE')) {
+              // This is the case when there's already an active sensor
+              Alert.alert(
+                'Sensor Already Active',
+                'This sensor is already activated. You can continue taking readings with it. If you want to activate a new sensor, please go to the Sensor screen first.',
                 [{ text: 'OK' }]
               );
             } else {
@@ -365,10 +539,24 @@ const HomeScreen = () => {
         }
       }
     } catch (error) {
-      console.error('Error initiating NFC scan:', error);
+      console.error('[HomeScreen] Error initiating NFC scan:', error);
       Alert.alert('Error', 'Failed to initiate sensor scan. Please check if NFC is supported and enabled on your device.');
     } finally {
+      // Always ensure cleanup and explicitly disable foreground dispatch
       setScanning(false);
+      nfcOperationInProgress.current = false;
+      
+      try {
+        // Explicitly disable NFC foreground dispatch after scanning
+        // This prevents automatic tag reading when not scanning
+        console.log('[HomeScreen] Disabling NFC foreground dispatch after manual scan');
+        await nfcCoreService.disableForegroundDispatch();
+      } catch (dispatchError) {
+        console.error('[HomeScreen] Error disabling foreground dispatch:', dispatchError);
+      }
+      
+      // Complete cleanup to ensure no resources are left open
+      await ensureNfcCleanup();
     }
   };
 
@@ -518,15 +706,37 @@ const HomeScreen = () => {
   
   // Handle monitoring errors
   const handleMonitoringError = (error: Error) => {
-    console.error('Monitoring error:', error);
+    console.error('[HomeScreen] Monitoring error:', error);
+    
+    // Check if monitoring is still active
+    const isActive = monitoringService.isMonitoring();
+    if (!isActive) {
+      setMonitoring(false);
+    }
+    
+    // Only show alerts if monitoring is active or if explicitly doing a manual scan
+    const shouldShowAlert = isActive || scanning;
     
     // Provide user-friendly feedback for common errors
     if (error.message.includes('TAG_NOT_FOUND')) {
       // This is expected when no sensor is connected - don't show an alert
-      console.log('No sensor was detected during monitoring - this is normal if no sensor is present');
+      console.log('[HomeScreen] No sensor was detected during monitoring - this is normal if no sensor is present');
+    } else if (error.message.includes('USER_CANCELLED')) {
+      // User cancelled the scan, no need to show an alert
+      console.log('[HomeScreen] Sensor scan was cancelled by the user');
+    } else if (error.message.includes('SENSOR_TIMEOUT')) {
+      // Timeout during sensor detection
+      console.log('[HomeScreen] Sensor scan timed out - no sensor found within timeout period');
+      if (shouldShowAlert) {
+        Alert.alert(
+          'Scan Timeout',
+          'Could not detect a sensor within the time limit. Please make sure your sensor is properly positioned.',
+          [{ text: 'OK' }]
+        );
+      }
     } else if (error.message.includes('COMMUNICATION_ERROR')) {
       // Only show an alert for communication errors if monitoring is active
-      if (monitoring) {
+      if (shouldShowAlert) {
         Alert.alert(
           'Communication Error',
           'Unable to read from sensor. Please make sure your sensor is properly positioned.',
@@ -535,19 +745,47 @@ const HomeScreen = () => {
       }
     } else if (error.message.includes('CANCELLED')) {
       // User cancelled the scan, no need to show an alert
-      console.log('Sensor scan was cancelled by the user');
-    } else if (monitoring) {
+      console.log('[HomeScreen] Sensor scan was cancelled by the user');
+    } else if (error.message.includes('CONCURRENT_OPERATION') || error.message.includes('in progress')) {
+      // For concurrent operation errors, delay the alert to see if it resolves itself quickly
+      // This prevents flashing alerts that disappear immediately
+      if (shouldShowAlert) {
+        // Create a delay before showing the alert
+        const delayTimer = setTimeout(() => {
+          // Check if monitoring is still active after delay
+          const stillActive = monitoringService.isMonitoring();
+          // Only show the alert if we're still in the scanning state
+          if (scanning) {
+            Alert.alert(
+              'NFC Busy',
+              'Another NFC operation is in progress. Monitoring will try again on the next cycle.',
+              [{ 
+                text: 'Reset NFC',
+                onPress: async () => {
+                  try {
+                    await ensureNfcCleanup();
+                    Alert.alert('NFC Reset', 'NFC has been reset and monitoring will continue.');
+                  } catch (resetError) {
+                    console.error('[HomeScreen] Error resetting NFC:', resetError);
+                  }
+                }
+              }, {
+                text: 'OK'
+              }]
+            );
+          }
+        }, 1500); // 1.5 second delay
+        
+        // Clear the timer if scanning state changes
+        return () => clearTimeout(delayTimer);
+      }
+    } else if (shouldShowAlert) {
       // For other errors, only alert if monitoring is active
       Alert.alert(
         'Reading Error',
         'There was a problem reading your glucose sensor. Please try again.',
         [{ text: 'OK' }]
       );
-    }
-    
-    // Check if monitoring is still active
-    if (!monitoringService.isMonitoring()) {
-      setMonitoring(false);
     }
   };
 
@@ -745,14 +983,30 @@ const HomeScreen = () => {
     
     const initializeServices = async () => {
       try {
-        // Check if device supports NFC - this is now handled by the NFC status check effect
+        // Initialize NFC Service first to prevent Android system from handling tags
+        // This needs to be done early in the app lifecycle
+        const nfcCoreService = NfcService.getInstance();
+        console.log('Initializing core NFC service...');
+        try {
+          await nfcCoreService.initialize();
+          console.log('Core NFC service initialization completed');
+          
+          // Ensure any previous operations are canceled
+          await nfcCoreService.forceCancelTechnologyRequest();
+          nfcCoreService.setOperationInProgress(false);
+        } catch (nfcCoreError) {
+          console.error('Core NFC service initialization failed:', nfcCoreError);
+        }
         
-        // Use a single initialization attempt to avoid race conditions
+        // Now initialize sensor-specific NFC service
         if (nfcService) {
           console.log('Starting NFC initialization...');
           try {
             await nfcService.initialize();
             console.log('NFC initialization completed');
+            
+            // Also ensure any pending operations are canceled here
+            await nfcService.cleanup();
           } catch (nfcError) {
             console.error('NFC initialization failed:', nfcError);
           }
@@ -779,7 +1033,18 @@ const HomeScreen = () => {
         monitoringService.stopMonitoring();
       }
       
-      // Safely clean up NFC
+      // Safely clean up NFC - first use the core service
+      const nfcCoreService = NfcService.getInstance();
+      if (nfcCoreService) {
+        try {
+          nfcCoreService.forceCancelTechnologyRequest();
+          nfcCoreService.setOperationInProgress(false);
+        } catch (error) {
+          console.error('Error cleaning up core NFC service:', error);
+        }
+      }
+      
+      // Then clean up the sensor-specific service
       if (nfcService && typeof nfcService.cleanup === 'function') {
         try {
           nfcService.cleanup();
@@ -796,8 +1061,12 @@ const HomeScreen = () => {
       setMonitoring(monitoringService.isMonitoring());
     };
     
+    // App state tracking
+    let lastAppStateChange = Date.now();
+    const MIN_SYNC_INTERVAL = 10000; // 10 seconds between app foreground syncs
+    
     // Add app state change listener
-    const subscription = AppState.addEventListener('change', (nextAppState) => {
+    const appStateSubscription = AppState.addEventListener('change', (nextAppState) => {
       if (appStateRef.current !== 'active' && nextAppState === 'active') {
         // Check monitoring status
         checkMonitoringStatus();
@@ -815,19 +1084,163 @@ const HomeScreen = () => {
             }
           })
           .catch(err => console.error('Error checking NFC after settings:', err));
+          
+        // Throttle foreground syncs by checking time since last state change
+        const now = Date.now();
+        const timeSinceLastStateChange = now - lastAppStateChange;
+        
+        if (timeSinceLastStateChange >= MIN_SYNC_INTERVAL && user && isMountedRef.current) {
+          // Update the last state change timestamp
+          lastAppStateChange = now;
+          
+          // Check if we have internet and trigger sync only if enough time has passed
+          NetInfo.fetch().then(state => {
+            if (state.isConnected) {
+              console.log('[HomeScreen] App returned to foreground with internet - syncing offline readings');
+              
+              MeasurementService.syncOfflineReadingsForUser(user.uid)
+                .then(result => {
+                  if (result && isMountedRef.current) {
+                    console.log('[HomeScreen] Successfully synced offline readings');
+                    // Reload readings after successful sync
+                    fetchGlucoseReadings();
+                  }
+                })
+                .catch(err => {
+                  console.error('[HomeScreen] Error syncing readings:', err);
+                });
+            }
+          });
+        } else {
+          console.log(`[HomeScreen] Skipping foreground sync - too soon since last state change (${timeSinceLastStateChange / 1000}s)`);
+        }
       }
+      
+      // Update app state reference
       appStateRef.current = nextAppState;
+      
+      // Track time of this state change
+      if (nextAppState === 'active' || nextAppState === 'background') {
+        lastAppStateChange = Date.now();
+      }
     });
     
     return () => {
-      subscription.remove();
+      if (appStateSubscription && typeof appStateSubscription.remove === 'function') {
+        appStateSubscription.remove();
+      }
     };
-  }, []);
+  }, [user]);
 
   // When the timeframe changes, refetch the data
   useEffect(() => {
     fetchGlucoseReadings();
   }, [chartTimeframe, user]);
+  
+  // This effect will update the chart data whenever lastReading changes
+  useEffect(() => {
+    if (lastReading && user) {
+      // When a new reading comes in, we need to update the chart data based on the current timeframe
+      // without changing the lastReading that we just set
+      const updateChartData = async () => {
+        try {
+          let updatedReadings: GlucoseReading[] = [];
+          
+          switch (chartTimeframe) {
+            case 'hour':
+              updatedReadings = await MeasurementService.getHourlyReadings(user.uid);
+              break;
+            case 'day':
+              updatedReadings = await MeasurementService.getDailyReadings(user.uid);
+              break;
+            case 'week':
+              updatedReadings = await MeasurementService.getWeeklyReadings(user.uid);
+              break;
+          }
+          
+          // If no readings returned but we have a lastReading, include it for hour view
+          if (chartTimeframe === 'hour' && updatedReadings.length === 0) {
+            updatedReadings = [lastReading];
+          }
+          
+          setGlucoseReadings(updatedReadings);
+        } catch (error) {
+          console.error('Error updating chart data after new reading:', error);
+        }
+      };
+      
+      updateChartData();
+    }
+  }, [lastReading, user, chartTimeframe]);
+
+  // Try to sync offline readings when the screen loads
+  useEffect(() => {
+    const attemptInitialSync = async () => {
+      if (user && isMountedRef.current && !initialSyncCompletedRef.current) {
+        // Check if we have internet before attempting sync
+        const state = await NetInfo.fetch();
+        if (state.isConnected) {
+          console.log('[HomeScreen] Initial sync of offline readings attempted');
+          initialSyncCompletedRef.current = true; // Mark as attempted
+          
+          MeasurementService.syncOfflineReadingsForUser(user.uid)
+            .then(result => {
+              if (result && isMountedRef.current) {
+                console.log('[HomeScreen] Successfully synced offline readings on initial load');
+                // Reload readings after successful sync
+                fetchGlucoseReadings();
+              }
+            })
+            .catch(err => {
+              console.error('[HomeScreen] Error syncing readings on initial load:', err);
+            });
+        }
+      }
+    };
+    
+    // Use a slight delay before attempting sync to avoid race conditions with other components
+    const syncTimer = setTimeout(attemptInitialSync, 1000);
+    
+    return () => {
+      clearTimeout(syncTimer);
+    };
+  }, [user]);
+
+  // Update isMounted ref when component unmounts
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  // Subscribe to new readings from the event system
+  useEffect(() => {
+    // Subscribe to new reading events
+    const readingsSubscription = GlucoseReadingEvents.getInstance().addNewReadingListener((newReading) => {
+      console.log('[HomeScreen] New reading event received:', newReading);
+      
+      // Update the last reading
+      setLastReading(newReading);
+      
+      // Also update the readings list for the chart
+      setGlucoseReadings(prevReadings => {
+        const updatedReadings = [newReading, ...prevReadings];
+        
+        // Sort by timestamp (newest first)
+        updatedReadings.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+        
+        return updatedReadings;
+      });
+    });
+    
+    return () => {
+      // Clean up the subscription on unmount
+      if (readingsSubscription && typeof readingsSubscription.remove === 'function') {
+        readingsSubscription.remove();
+      }
+    };
+  }, []);
 
   // Render monitoring controls
   const renderMonitoringControls = () => {
@@ -929,6 +1342,28 @@ const HomeScreen = () => {
       <View style={styles.nfcStatusContainer}>
         <View style={[styles.nfcStatusIndicator, styles.nfcStatusReady]} />
         <Text style={styles.nfcStatusText}>NFC ready</Text>
+      </View>
+    );
+  };
+
+  // Render scan button with clear instructions
+  const renderScanButton = () => {
+    return (
+      <View style={styles.scanButtonContainer}>
+        <TouchableOpacity 
+          style={styles.scanButton}
+          onPress={handleManualReading}
+          disabled={scanning}
+        >
+          {scanning ? (
+            <>
+              <ActivityIndicator size="small" color="#fff" style={styles.scanButtonIcon} />
+              <Text style={styles.scanButtonText}>Reading Sensor...</Text>
+            </>
+          ) : (
+            <Text style={styles.scanButtonText}>Scan Sensor</Text>
+          )}
+        </TouchableOpacity>
       </View>
     );
   };
@@ -1087,17 +1522,7 @@ const HomeScreen = () => {
       </View>
       
       {/* NFC Scan Button */}
-      <TouchableOpacity 
-        style={styles.scanButton}
-        onPress={handleManualReading}
-        disabled={scanning}
-      >
-        {scanning ? (
-          <ActivityIndicator size="small" color="#fff" />
-        ) : (
-          <Text style={styles.scanButtonText}>Scan Sensor</Text>
-        )}
-      </TouchableOpacity>
+      {renderScanButton()}
       
       {/* Continuous Monitoring Controls */}
       {renderMonitoringControls()}
@@ -1250,14 +1675,19 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#888',
   },
+  scanButtonContainer: {
+    alignItems: 'center',
+    marginVertical: 30,
+  },
   scanButton: {
     backgroundColor: '#4CC9F0',
     height: 56,
+    minWidth: 220,
     justifyContent: 'center',
     alignItems: 'center',
     borderRadius: 28,
     marginHorizontal: 40,
-    marginVertical: 30,
+    paddingHorizontal: 25,
     shadowColor: '#000',
     shadowOffset: {
       width: 0,
@@ -1266,11 +1696,16 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.25,
     shadowRadius: 3.84,
     elevation: 5,
+    flexDirection: 'row',
   },
   scanButtonText: {
     color: 'white',
     fontSize: 18,
     fontWeight: 'bold',
+    textAlign: 'center',
+  },
+  scanButtonIcon: {
+    marginRight: 10,
   },
   monitoringContainer: {
     backgroundColor: 'white',

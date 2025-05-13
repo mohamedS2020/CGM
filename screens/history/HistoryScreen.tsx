@@ -15,6 +15,7 @@ import {
 import { useAuth } from '../../context/AuthContext';
 import MeasurementService, { GlucoseReading } from '../../services/MeasurementService';
 import { Ionicons } from '@expo/vector-icons';
+import GlucoseReadingEvents from '../../services/GlucoseReadingEvents';
 
 // Mock glucose level ranges (same as in HomeScreen)
 const GLUCOSE_LOW = 70;
@@ -67,6 +68,43 @@ const HistoryScreen = () => {
     setLoading(true);
     fetchReadings();
   }, [fetchReadings, timeframeFilter]);
+
+  // Subscribe to real-time reading updates
+  useEffect(() => {
+    // Subscribe to new reading events
+    const subscription = GlucoseReadingEvents.getInstance().addNewReadingListener((newReading) => {
+      console.log('[HistoryScreen] New reading event received:', newReading);
+      
+      // Update the readings list
+      setReadings(prevReadings => {
+        // Check if reading already exists (by ID or by timestamp for offline readings)
+        const existingIndex = prevReadings.findIndex(r => 
+          r.id === newReading.id || 
+          (r.timestamp.getTime() === newReading.timestamp.getTime() && r.value === newReading.value)
+        );
+        
+        if (existingIndex >= 0) {
+          // Replace the existing reading
+          const updatedReadings = [...prevReadings];
+          updatedReadings[existingIndex] = newReading;
+          return updatedReadings;
+        } else {
+          // Add the new reading
+          const updatedReadings = [newReading, ...prevReadings];
+          
+          // Sort by timestamp (newest first)
+          updatedReadings.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+          
+          return updatedReadings;
+        }
+      });
+    });
+    
+    return () => {
+      // Clean up the subscription on unmount
+      subscription.remove();
+    };
+  }, []);
 
   // Open the comment modal
   const handleReadingPress = (reading: GlucoseReading) => {

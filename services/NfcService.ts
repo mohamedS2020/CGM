@@ -35,8 +35,15 @@ class NfcService {
   
   /**
    * Check if an NFC operation is currently in progress
+   * @param resetIfStuck If true, will attempt to reset the NFC system if an operation appears stuck
    */
-  public isOperationInProgress(): boolean {
+  public isOperationInProgress(resetIfStuck: boolean = false): boolean {
+    // If operation has been in progress for a long time, it might be stuck
+    if (resetIfStuck && this.operationInProgress && this.operationTimeout) {
+      console.log('[NfcService] NFC operation may be stuck, attempting to reset...');
+      this.resetNfcSystem();
+      return false;
+    }
     return this.operationInProgress;
   }
   
@@ -44,7 +51,7 @@ class NfcService {
    * Set the operation state, with an optional automatic timeout
    * to prevent operations getting stuck in "in progress" state
    */
-  public setOperationInProgress(inProgress: boolean, timeoutMs: number = 10000): void {
+  public setOperationInProgress(inProgress: boolean, timeoutMs: number = 30000): void {
     this.operationInProgress = inProgress;
     
     // Clear any existing timeout
@@ -83,6 +90,10 @@ class NfcService {
       // Wait for initialization to complete
       this.isNfcSupported = await this.initializationPromise;
       this.isInitialized = true;
+      
+      // DON'T enable foreground dispatch yet - we'll do this only when explicitly requested
+      // This prevents auto-scanning for NFC tags when the app starts
+      
       return this.isNfcSupported;
     } catch (error) {
       console.error('[NfcService] Initialization failed:', error);
@@ -92,6 +103,66 @@ class NfcService {
     } finally {
       // Clear promise to allow future initialization attempts
       this.initializationPromise = null;
+    }
+  }
+  
+  /**
+   * Enable foreground dispatch to prevent Android system from handling NFC tags
+   * This makes our app the preferred handler for NFC tags while it's in the foreground
+   * 
+   * IMPORTANT: Only call this when you're about to scan, not during app initialization
+   * to prevent automatic scanning
+   */
+  public async enableForegroundDispatch(): Promise<void> {
+    try {
+      if (Platform.OS !== 'android' || !this.isNfcSupported) {
+        return;
+      }
+      
+      if (typeof NfcManager.setEventListener !== 'function') {
+        console.warn('[NfcService] NfcManager.setEventListener is not available, can\'t enable foreground dispatch');
+        return;
+      }
+      
+      // Set a null event listener to prevent the system from auto-handling tags
+      NfcManager.setEventListener(NfcEvents.DiscoverTag, null);
+      
+      // For Android, also register to get raw tag discovery events
+      if (typeof NfcManager.registerTagEvent === 'function') {
+        try {
+          await NfcManager.registerTagEvent();
+          console.log('[NfcService] Android foreground dispatch enabled - app will now handle NFC tags automatically');
+        } catch (error) {
+          console.error('[NfcService] Error registering tag event:', error);
+        }
+      } else {
+        console.warn('[NfcService] NfcManager.registerTagEvent is not available');
+      }
+    } catch (error) {
+      console.error('[NfcService] Error enabling foreground dispatch:', error);
+    }
+  }
+  
+  /**
+   * Disable foreground dispatch to return to normal NFC handling
+   * Call this after scanning is complete to prevent automatic tag reading
+   */
+  public async disableForegroundDispatch(): Promise<void> {
+    try {
+      if (Platform.OS !== 'android' || !this.isNfcSupported) {
+        return;
+      }
+      
+      if (typeof NfcManager.unregisterTagEvent === 'function') {
+        try {
+          await NfcManager.unregisterTagEvent();
+          console.log('[NfcService] Android foreground dispatch disabled');
+        } catch (error) {
+          console.error('[NfcService] Error unregistering tag event:', error);
+        }
+      }
+    } catch (error) {
+      console.error('[NfcService] Error disabling foreground dispatch:', error);
     }
   }
   
@@ -153,13 +224,8 @@ class NfcService {
         const isSupported = await NfcManager.isSupported();
         console.log(`[NfcService] NFC is ${isSupported ? 'supported' : 'not supported'} on this device`);
         
-        // Register event listener if supported
-        if (isSupported && typeof NfcManager.setEventListener === 'function') {
-          NfcManager.setEventListener(NfcEvents.DiscoverTag, (tag: any) => {
-            console.log('[NfcService] Tag discovered:', tag);
-          });
-          console.log('[NfcService] NFC event listeners registered');
-        }
+        // For Android, we want to use registerTagEvent later instead of setEventListener
+        // to handle NFC tags properly and prevent system from intercepting them
         
         return !!isSupported;
       } catch (error) {
@@ -210,6 +276,11 @@ class NfcService {
       if (this.isNfcSupported && typeof NfcManager !== 'undefined' && NfcManager !== null) {
         console.log('[NfcService] Cleaning up NFC resources...');
         
+        // Disable foreground dispatch on Android if enabled
+        if (Platform.OS === 'android') {
+          await this.disableForegroundDispatch();
+        }
+        
         // Cancel any ongoing operations
         if (typeof NfcManager.cancelTechnologyRequest === 'function') {
           try {
@@ -233,6 +304,85 @@ class NfcService {
       }
     } catch (error) {
       console.error('[NfcService] Error during NFC cleanup:', error);
+    }
+  }
+  
+  /**
+   * Reset the NFC system if it appears to be stuck
+   * This will force cancel any pending operations and reset the state
+   */
+  public async resetNfcSystem(): Promise<void> {
+    console.log('[NfcService] Resetting NFC system...');
+    
+    // Clear any operation timeout
+    if (this.operationTimeout) {
+      clearTimeout(this.operationTimeout);
+      this.operationTimeout = null;
+    }
+    
+    // Reset the operation state
+    this.operationInProgress = false;
+    
+    // Force cancel any technology request
+    await this.forceCancelTechnologyRequest();
+    
+    // More aggressive cleanup - try multiple methods
+    try {
+      // Cancel tech request first 
+      if (typeof NfcManager.cancelTechnologyRequest === 'function') {
+        try {
+          await NfcManager.cancelTechnologyRequest();
+        } catch (e) {
+          // Ignore errors
+        }
+      }
+      
+      // Remove all event listeners
+      if (typeof NfcManager.setEventListener === 'function') {
+        try {
+          NfcManager.setEventListener(NfcEvents.DiscoverTag, null);
+          NfcManager.setEventListener(NfcEvents.SessionClosed, null);
+          NfcManager.setEventListener(NfcEvents.StateChanged, null);
+        } catch (e) {
+          // Ignore errors
+        }
+      }
+      
+      // For Android, ensure tag events are unregistered
+      if (Platform.OS === 'android' && typeof NfcManager.unregisterTagEvent === 'function') {
+        try {
+          await NfcManager.unregisterTagEvent();
+        } catch (e) {
+          // Ignore errors
+        }
+      }
+      
+      // Wait a small amount of time for the system to settle
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // For iOS, try to invalidate the session if possible
+      if (Platform.OS === 'ios' && typeof NfcManager.invalidateSessionWithErrorIOS === 'function') {
+        try {
+          await NfcManager.invalidateSessionWithErrorIOS('Session invalidated due to reset');
+        } catch (e) {
+          // Ignore errors
+        }
+      }
+    } catch (cleanupError) {
+      console.error('[NfcService] Error during aggressive NFC cleanup:', cleanupError);
+      // Continue with reset process regardless of errors
+    }
+    
+    if (Platform.OS === 'android') {
+      try {
+        // Disable and re-enable foreground dispatch
+        await this.disableForegroundDispatch();
+        // Don't automatically re-enable foreground dispatch
+        // Only enable it when explicitly requested
+        console.log('[NfcService] NFC system reset complete');
+      } catch (error) {
+        console.error('[NfcService] Error resetting NFC system:', error);
+      }
     }
   }
 }

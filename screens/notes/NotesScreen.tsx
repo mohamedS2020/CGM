@@ -14,35 +14,16 @@ import {
   Platform
 } from 'react-native';
 import { useAuth } from '../../context/AuthContext';
-import { db } from '../../firebase/firebaseconfig';
-import {
-  collection,
-  doc,
-  addDoc,
-  updateDoc,
-  deleteDoc,
-  getDocs,
-  query,
-  orderBy,
-  serverTimestamp,
-  Timestamp
-} from 'firebase/firestore';
 import { Ionicons } from '@expo/vector-icons';
-
-// Interface for note object
-interface Note {
-  id?: string;
-  title: string;
-  body: string;
-  timestamp: Date;
-  createdAt?: Date;
-}
+import NotesService, { Note } from '../../services/NotesService';
+import NetInfo from '@react-native-community/netinfo';
 
 const NotesScreen = () => {
   const { user } = useAuth();
   const [notes, setNotes] = useState<Note[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [isOnline, setIsOnline] = useState(true);
   
   // Modal states
   const [modalVisible, setModalVisible] = useState(false);
@@ -53,27 +34,29 @@ const NotesScreen = () => {
   const [saving, setSaving] = useState(false);
   const [deleteModalVisible, setDeleteModalVisible] = useState(false);
 
-  // Fetch notes from Firestore
+  // Initialize connectivity monitoring
+  useEffect(() => {
+    if (user) {
+      NotesService.initConnectivityMonitoring(user.uid);
+      
+      // Setup connectivity listener for UI indicator
+      const unsubscribe = NetInfo.addEventListener(state => {
+        setIsOnline(state.isConnected !== false && state.isInternetReachable !== false);
+      });
+      
+      return () => {
+        NotesService.stopConnectivityMonitoring();
+        unsubscribe();
+      };
+    }
+  }, [user]);
+
+  // Fetch notes from service
   const fetchNotes = useCallback(async () => {
     if (!user) return;
     
     try {
-      const notesRef = collection(db, 'users', user.uid, 'notes');
-      const q = query(notesRef, orderBy('timestamp', 'desc'));
-      const querySnapshot = await getDocs(q);
-      
-      const fetchedNotes: Note[] = [];
-      querySnapshot.forEach((doc) => {
-        const data = doc.data();
-        fetchedNotes.push({
-          id: doc.id,
-          title: data.title,
-          body: data.body,
-          timestamp: data.timestamp.toDate(),
-          createdAt: data.createdAt?.toDate()
-        });
-      });
-      
+      const fetchedNotes = await NotesService.getNotes(user.uid);
       setNotes(fetchedNotes);
     } catch (error) {
       console.error('Error fetching notes:', error);
@@ -85,10 +68,22 @@ const NotesScreen = () => {
   }, [user]);
 
   // Handle refresh
-  const onRefresh = useCallback(() => {
+  const onRefresh = useCallback(async () => {
     setRefreshing(true);
+    
+    // Check if we're online to attempt a sync
+    const netInfo = await NetInfo.fetch();
+    if (netInfo.isConnected && netInfo.isInternetReachable !== false && user) {
+      try {
+        // Try to sync offline notes before refreshing the list
+        await NotesService.syncOfflineNotesForUser(user.uid);
+      } catch (error) {
+        console.error('Error syncing notes during refresh:', error);
+      }
+    }
+    
     fetchNotes();
-  }, [fetchNotes]);
+  }, [fetchNotes, user]);
 
   // Load notes when component mounts
   useEffect(() => {
@@ -132,12 +127,7 @@ const NotesScreen = () => {
     try {
       if (editMode && selectedNote?.id) {
         // Update existing note
-        const noteRef = doc(db, 'users', user.uid, 'notes', selectedNote.id);
-        await updateDoc(noteRef, {
-          title,
-          body,
-          timestamp: serverTimestamp()
-        });
+        await NotesService.updateNote(user.uid, selectedNote.id, { title, body });
         
         // Update state
         setNotes(prevNotes => prevNotes.map(note => 
@@ -149,25 +139,20 @@ const NotesScreen = () => {
         Alert.alert('Success', 'Note updated successfully');
       } else {
         // Add new note
-        const notesRef = collection(db, 'users', user.uid, 'notes');
-        const newNote = {
+        const newNote: Note = {
           title,
           body,
-          timestamp: serverTimestamp(),
-          createdAt: serverTimestamp()
+          timestamp: new Date(),
+          createdAt: new Date()
         };
         
-        const docRef = await addDoc(notesRef, newNote);
+        const noteId = await NotesService.addNote(user.uid, newNote);
         
         // Update state
-        const now = new Date();
         setNotes(prevNotes => [
           {
-            id: docRef.id,
-            title,
-            body,
-            timestamp: now,
-            createdAt: now
+            ...newNote,
+            id: noteId,
           },
           ...prevNotes
         ]);
@@ -190,8 +175,7 @@ const NotesScreen = () => {
     if (!user || !selectedNote?.id) return;
     
     try {
-      const noteRef = doc(db, 'users', user.uid, 'notes', selectedNote.id);
-      await deleteDoc(noteRef);
+      await NotesService.deleteNote(user.uid, selectedNote.id);
       
       // Update state
       setNotes(prevNotes => prevNotes.filter(note => note.id !== selectedNote.id));
@@ -225,6 +209,7 @@ const NotesScreen = () => {
       <View style={styles.noteContent}>
         <Text style={styles.noteTitle} numberOfLines={1}>
           {item.title}
+          {item._isOffline && <Text style={styles.offlineIndicator}> (offline)</Text>}
         </Text>
         <Text style={styles.notePreview} numberOfLines={2}>
           {item.body}
@@ -248,12 +233,20 @@ const NotesScreen = () => {
       {/* Header with Add Button */}
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Notes</Text>
-        <TouchableOpacity 
-          style={styles.addButton}
-          onPress={handleAddNote}
-        >
-          <Ionicons name="add" size={24} color="white" />
-        </TouchableOpacity>
+        <View style={styles.headerRight}>
+          {!isOnline && (
+            <View style={styles.offlineIndicatorContainer}>
+              <Ionicons name="cloud-offline-outline" size={18} color="#FF8C00" />
+              <Text style={styles.offlineText}>Offline</Text>
+            </View>
+          )}
+          <TouchableOpacity 
+            style={styles.addButton}
+            onPress={handleAddNote}
+          >
+            <Ionicons name="add" size={24} color="white" />
+          </TouchableOpacity>
+        </View>
       </View>
       
       {/* Notes List */}
@@ -414,6 +407,24 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#333',
   },
+  headerRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  offlineIndicatorContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginRight: 12,
+    backgroundColor: '#FFEBCD',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 12,
+  },
+  offlineText: {
+    fontSize: 12,
+    color: '#FF8C00',
+    marginLeft: 4,
+  },
   addButton: {
     width: 40,
     height: 40,
@@ -487,6 +498,11 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#333',
     marginBottom: 5,
+  },
+  offlineIndicator: {
+    fontSize: 12,
+    fontStyle: 'italic',
+    color: '#FF8C00',
   },
   notePreview: {
     fontSize: 14,

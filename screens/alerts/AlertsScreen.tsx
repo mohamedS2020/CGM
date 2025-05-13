@@ -9,8 +9,11 @@ import {
   TextInput,
   ActivityIndicator,
   Alert,
-  RefreshControl
+  RefreshControl,
+  KeyboardAvoidingView,
+  Platform
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuth } from '../../context/AuthContext';
 import MeasurementService, { GlucoseReading } from '../../services/MeasurementService';
 import { Ionicons } from '@expo/vector-icons';
@@ -22,6 +25,7 @@ const GLUCOSE_HIGH = 180;
 
 const AlertsScreen = () => {
   const { user } = useAuth();
+  const insets = useSafeAreaInsets();
   const [alerts, setAlerts] = useState<GlucoseReading[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -121,13 +125,28 @@ const AlertsScreen = () => {
       const newSound = new Audio.Sound();
       setSound(newSound);
       
-      // Generate a beep sound using native beep on most devices
-      await newSound.loadAsync(require('expo-av/build/Audio/INTERRUPTION_BEGIN.mp3'));
-      await newSound.setVolumeAsync(1.0);
-      await newSound.setIsLoopingAsync(false);
-      
-      // Play the sound
-      await newSound.playAsync();
+      // Use a simple programmatic beep sound instead of trying to load a file
+      // This will work more reliably across all devices
+      try {
+        // Try to use a simple system sound
+        await newSound.loadAsync(require('../../assets/sounds/alarm.mp3'));
+        await newSound.setVolumeAsync(1.0);
+        await newSound.setIsLoopingAsync(false);
+        await newSound.playAsync();
+      } catch (soundError) {
+        console.log('Using fallback sound mechanism');
+        // Fallback - on many devices we can use the system notification sound
+        // by creating a very short sound programmatically
+        const shortSound = new Audio.Sound();
+        try {
+          // Create a simple short beep using a system sound
+          await shortSound.loadAsync({ uri: 'system://notification' });
+          await shortSound.setVolumeAsync(1.0);
+          await shortSound.playAsync();
+        } catch (fallbackError) {
+          console.error('Fallback sound also failed:', fallbackError);
+        }
+      }
       
       // Unload the sound after playing
       setTimeout(async () => {
@@ -276,13 +295,20 @@ const AlertsScreen = () => {
     <View style={styles.dateSection}>
       <Text style={styles.dateSectionHeader}>{item.date}</Text>
       <View style={styles.dateSectionContent}>
-        {item.alerts.map(alert => renderAlertItem({ item: alert }))}
+        {item.alerts.map(alert => (
+          <React.Fragment key={alert.id || `${alert.timestamp.getTime()}-${alert.value}`}>
+            {renderAlertItem({ item: alert })}
+          </React.Fragment>
+        ))}
       </View>
     </View>
   );
 
   return (
-    <View style={styles.container}>
+    <KeyboardAvoidingView 
+      style={styles.container}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+    >
       {/* Timeframe Filter */}
       <View style={styles.headerContainer}>
         <View style={styles.filterContainer}>
@@ -355,7 +381,10 @@ const AlertsScreen = () => {
           data={groupAlertsByDate()}
           renderItem={renderDateSection}
           keyExtractor={item => item.date}
-          contentContainerStyle={styles.listContent}
+          contentContainerStyle={[
+            styles.listContent,
+            { paddingBottom: 120 + insets.bottom } // Increased padding to account for the floating plus button
+          ]}
           refreshControl={
             <RefreshControl
               refreshing={refreshing}
@@ -374,7 +403,10 @@ const AlertsScreen = () => {
         onRequestClose={() => setModalVisible(false)}
       >
         <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
+          <View style={[
+            styles.modalContent,
+            { paddingBottom: 30 + insets.bottom } // Add safe area padding to modal
+          ]}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Alert Details</Text>
               <TouchableOpacity
@@ -456,7 +488,7 @@ const AlertsScreen = () => {
           </View>
         </View>
       </Modal>
-    </View>
+    </KeyboardAvoidingView>
   );
 };
 
@@ -545,7 +577,7 @@ const styles = StyleSheet.create({
     marginTop: 10,
   },
   listContent: {
-    paddingBottom: 20,
+    paddingBottom: 20, // This will be overridden with the dynamic padding
   },
   dateSection: {
     marginBottom: 15,

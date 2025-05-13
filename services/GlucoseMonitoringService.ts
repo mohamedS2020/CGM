@@ -4,19 +4,14 @@ import GlucoseCalculationService from './GlucoseCalculationService';
 import MeasurementService, { GlucoseReading } from './MeasurementService';
 import FreeStyleLibreService from './FreeStyleLibreService';
 import { SensorType } from './SensorDetectionService';
-
-// Define reading source if not already defined
-export enum ReadingSource {
-  MANUAL_SCAN = 'manual_scan',
-  AUTO_MONITOR = 'auto_monitor',
-  CALIBRATION = 'calibration',
-  LIBRE_SENSOR = 'libre_sensor'
-}
+import GlucoseReadingEvents from './GlucoseReadingEvents';
+import NfcService from './NfcService';
+import { ReadingSource } from './ReadingTypes';
 
 // Extend the GlucoseReading interface to include source
 declare module './MeasurementService' {
   export interface GlucoseReading {
-    source?: ReadingSource;
+    source?: ReadingSource; // Only use ReadingSource from shared types
     userId?: string;
   }
 }
@@ -44,6 +39,7 @@ export default class GlucoseMonitoringService {
   private nextReadingTimeout: number | null = null;
   private nfcAvailable = false;
   private currentSensorType: SensorType = SensorType.RF430;
+  private readingSource: ReadingSource = ReadingSource.LIBRE_SENSOR;
   
   // Service instances
   private nfcService: SensorNfcService;
@@ -206,6 +202,31 @@ export default class GlucoseMonitoringService {
         console.log('GlucoseMonitoringService: Sensor detected, proceeding with monitoring');
       } catch (sensorError) {
         console.error('GlucoseMonitoringService: No sensor detected:', sensorError);
+        
+        // Check for specific error types we want to handle specially
+        if (sensorError instanceof Error) {
+          const errorMessage = sensorError.message;
+          
+          // If the user cancelled the scan, we should handle this as a special case
+          if (errorMessage === 'CANCELLED' || errorMessage.includes('UserCancel')) {
+            console.log('GlucoseMonitoringService: User cancelled sensor detection, not treating as error');
+            if (this.onErrorCallback) {
+              this.onErrorCallback(new Error('USER_CANCELLED'));
+            }
+            return 'USER_CANCELLED';
+          }
+          
+          // For timeouts, we'll also provide a more specific error
+          if (errorMessage === 'TIMEOUT' || errorMessage.includes('timeout')) {
+            console.log('GlucoseMonitoringService: Sensor detection timed out');
+            if (this.onErrorCallback) {
+              this.onErrorCallback(new Error('SENSOR_TIMEOUT'));
+            }
+            return 'SENSOR_TIMEOUT';
+          }
+        }
+        
+        // For all other errors, we'll treat it as sensor not found
         if (this.onErrorCallback) {
           this.onErrorCallback(new Error('SENSOR_NOT_FOUND'));
         }
@@ -253,6 +274,29 @@ export default class GlucoseMonitoringService {
       return true;
     } catch (error) {
       console.error('GlucoseMonitoringService: Failed to start monitoring:', error);
+      
+      // Check for user cancellation or timeout at the top level
+      if (error instanceof Error) {
+        const errorMessage = error.message;
+        if (errorMessage === 'CANCELLED' || errorMessage.includes('UserCancel')) {
+          if (this.onErrorCallback) {
+            this.onErrorCallback(new Error('USER_CANCELLED'));
+          }
+          // Cleanup partial start
+          this.stopMonitoring();
+          return 'USER_CANCELLED';
+        }
+        
+        if (errorMessage === 'TIMEOUT' || errorMessage.includes('timeout')) {
+          if (this.onErrorCallback) {
+            this.onErrorCallback(new Error('SENSOR_TIMEOUT'));
+          }
+          // Cleanup partial start
+          this.stopMonitoring();
+          return 'SENSOR_TIMEOUT';
+        }
+      }
+      
       if (this.onErrorCallback) {
         this.onErrorCallback(error instanceof Error ? error : new Error('START_MONITORING_FAILED'));
       }
@@ -337,6 +381,22 @@ export default class GlucoseMonitoringService {
    */
   public getLastReading(): GlucoseReading | null {
     return this.lastReading;
+  }
+  
+  /**
+   * Set the last glucose reading
+   * Used when a reading is obtained outside the normal monitoring cycle
+   */
+  public setLastReading(reading: GlucoseReading): void {
+    this.lastReading = reading;
+    
+    // Notify of new reading if callback is set
+    if (this.onNewReadingCallback) {
+      this.onNewReadingCallback(reading);
+    }
+    
+    // Also emit the event for other components
+    GlucoseReadingEvents.getInstance().emitNewReading(reading);
   }
   
   /**
@@ -494,6 +554,9 @@ export default class GlucoseMonitoringService {
         this.onNewReadingCallback(fullReading);
       }
       
+      // Also emit the event for other components
+      GlucoseReadingEvents.getInstance().emitNewReading(fullReading);
+      
       // Show alert notification for out-of-range readings
       if (reading.isAlert) {
         const alertType = reading.value < this.glucoseCalculationService.GLUCOSE_LOW ? 'low' : 'high';
@@ -529,98 +592,232 @@ export default class GlucoseMonitoringService {
   }
   
   /**
+   * Set the user ID for readings
+   */
+  public setUserId(userId: string): void {
+    this.userId = userId;
+    console.log(`[GlucoseMonitoringService] User ID set to: ${userId}`);
+  }
+
+  /**
+   * Get the current user ID
+   */
+  public getUserId(): string | null {
+    return this.userId;
+  }
+
+  /**
    * Manual reading - forces an immediate glucose reading
    */
-  public async takeManualReading(): Promise<GlucoseReading> {
+  public async takeManualReading(userId?: string): Promise<GlucoseReading> {
+    // Track if we need to restore monitoring after the reading
+    let wasMonitoring = false;
+    let monitoringInterval = this.monitoringInterval;
+    
     try {
-      // Ensure NFC is initialized before attempting to read
-      if (this.nfcService) {
-        try {
-          console.log('Ensuring NFC is initialized before manual reading...');
-          await this.nfcService.initialize();
-        } catch (initError) {
-          console.error('Failed to initialize NFC before manual reading:', initError);
-          // Continue anyway - readGlucoseSensor will also check initialization
+      // If userId is provided, use it, otherwise use the stored one
+      if (userId) {
+        this.userId = userId;
+      }
+      
+      // Ensure user ID is set
+      if (!this.userId) {
+        throw new Error('User ID not set. Cannot store reading.');
+      }
+      
+      // Temporarily pause monitoring if it's active to prevent conflicts
+      if (this.monitoringActive) {
+        console.log('[GlucoseMonitoringService] Temporarily pausing continuous monitoring for manual reading');
+        wasMonitoring = true;
+        
+        // Pause the monitoring by clearing the timer, but don't change monitoringActive flag
+        if (this.timerId) {
+          clearTimeout(this.timerId);
+          this.timerId = null;
         }
       }
-
-      let reading: GlucoseReading;
       
-      // Use appropriate service based on sensor type
-      if (this.currentSensorType === SensorType.LIBRE) {
-        // Use FreeStyle Libre service
-        console.log('GlucoseMonitoringService: Taking manual reading from FreeStyle Libre sensor');
-        reading = await this.libreService.readGlucoseData();
-        reading.source = ReadingSource.MANUAL_SCAN;
-      } else {
-        // Use RF430 service (existing implementation)
-        console.log('GlucoseMonitoringService: Taking manual reading from RF430 sensor');
-        const adcValue = await this.nfcService.safeReadGlucoseSensor();
+      // Check if another NFC operation is already in progress
+      const nfcCoreService = NfcService.getInstance();
+      
+      // Always force reset NFC system before taking a manual reading
+      console.log('[GlucoseMonitoringService] Forcefully resetting NFC system before manual reading...');
+      try {
+        // Force reset any stuck operations first
+        await nfcCoreService.forceCancelTechnologyRequest();
+        await nfcCoreService.resetNfcSystem();
+        nfcCoreService.setOperationInProgress(false);
         
-        // If adcValue is -1, it means another NFC operation was in progress, so skip this cycle
-        if (adcValue === -1) {
-          console.log('Manual reading aborted - another NFC operation in progress');
-          throw new Error('CONCURRENT_OPERATION: Please wait for any ongoing NFC operations to complete');
+        // Add a small delay to ensure NFC system has time to reset
+        await new Promise(resolve => setTimeout(resolve, 300));
+      } catch (resetError) {
+        console.error('[GlucoseMonitoringService] Error resetting NFC system:', resetError);
+        // Continue anyway
+      }
+
+      // Double-check if an operation is still in progress after reset
+      if (nfcCoreService.isOperationInProgress()) {
+        console.error('[GlucoseMonitoringService] NFC still busy after attempted reset');
+        throw new Error('CONCURRENT_OPERATION: Another NFC operation is already in progress. Please wait and try again.');
+      }
+      
+      // Set operation as in progress with a timeout
+      nfcCoreService.setOperationInProgress(true, 45000); // 45 second timeout
+      
+      // Explicitly enable foreground dispatch before reading
+      try {
+        console.log('[GlucoseMonitoringService] Enabling NFC foreground dispatch for manual reading...');
+        await nfcCoreService.enableForegroundDispatch();
+      } catch (dispatchError) {
+        console.error('[GlucoseMonitoringService] Error enabling foreground dispatch:', dispatchError);
+        // Continue anyway, as direct NFC operations might still work
+      }
+      
+      // Add a short delay to give user time to position sensor
+      console.log('[GlucoseMonitoringService] Ready to scan - please position sensor against your device and hold steady');
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      try {
+        // Ensure NFC is initialized before attempting to read
+        if (this.nfcService) {
+          try {
+            console.log('[GlucoseMonitoringService] Ensuring NFC is initialized before manual reading...');
+            await this.nfcService.initialize();
+          } catch (initError) {
+            console.error('[GlucoseMonitoringService] Failed to initialize NFC before manual reading:', initError);
+            // Continue anyway, as the reading method will also try to initialize
+          }
         }
         
-        // Convert ADC value to glucose level
-        const glucoseValue = this.glucoseCalculationService.adcToGlucose(adcValue);
-
-        // Create a reading object
-        reading = {
-          value: glucoseValue,
-          timestamp: new Date(),
-          source: ReadingSource.MANUAL_SCAN,
-          userId: this.userId || 'unknown',
-          isAlert: this.glucoseCalculationService.isGlucoseInAlertRange(glucoseValue)
+        console.log('[GlucoseMonitoringService] Taking manual glucose reading...');
+        
+        // Determine which reading source to use
+        let reading: GlucoseReading;
+        let readingId: string;
+        
+        if (this.readingSource === ReadingSource.LIBRE_SENSOR && this.libreService) {
+          // Try reading from FreeStyle Libre sensor
+          console.log('[GlucoseMonitoringService] Taking reading from FreeStyle Libre sensor...');
+          reading = await this.libreService.readGlucoseData();
+        } else {
+          // Default to reading from RF430 sensor
+          console.log('[GlucoseMonitoringService] Taking reading from RF430 sensor...');
+          
+          if (!this.nfcService) {
+            throw new Error('NFC Service not initialized');
+          }
+          
+          // Get glucose value
+          const glucoseValue = await this.nfcService.safeReadGlucoseSensor();
+          
+          // Create reading object
+          reading = {
+            value: glucoseValue,
+            timestamp: new Date(),
+            isAlert: this.checkIfAlert(glucoseValue)
+          };
+        }
+        
+        // Adding reading to Firestore
+        console.log(`[GlucoseMonitoringService] Storing manual reading (${reading.value} mg/dL) for user ${this.userId}...`);
+        
+        // Check for network connectivity
+        readingId = await MeasurementService.addReading(this.userId, reading);
+        
+        // Create full reading with ID
+        const fullReading: GlucoseReading = {
+          ...reading,
+          id: readingId
         };
-      }
-
-      // Save reading to database
-      if (this.userId) {
-        const readingId = await MeasurementService.addReading(this.userId, reading);
-        reading.id = readingId;
-      }
-
-      // Trigger the callback for a new reading (if monitoring is active)
-      if (this.monitoringActive && this.onNewReadingCallback) {
-        this.onNewReadingCallback(reading);
-      }
-
-      // Unlock the scanner for next reading
-      this.consecutiveErrorCount = 0;
-
-      return reading;
-    } catch (error) {
-      console.error('Error in takeManualReading:', error);
-      
-      // Don't increment error count for concurrent operation errors
-      if (!(error instanceof Error && 
-           error.message.includes('CONCURRENT_OPERATION'))) {
-        this.consecutiveErrorCount++;
-      }
-      
-      // Notify the error callback if available
-      if (this.onErrorCallback) {
-        this.onErrorCallback(error instanceof Error ? error : new Error('Unknown error taking reading'));
-      }
-      
-      // Check if the error is related to NFC not being supported
-      if (error instanceof Error) {
-        const errorMessage = error.message.toLowerCase();
-        if (errorMessage.includes('nfc not supported') || 
-            errorMessage.includes('nfc is not available') ||
-            errorMessage.includes('cannot convert null value')) {
-          throw new Error('NOT_SUPPORTED: NFC is not available on this device');
+        
+        // Update last reading value
+        this.lastReading = fullReading;
+        
+        // Notify of new reading
+        if (this.onNewReadingCallback) {
+          this.onNewReadingCallback(fullReading);
         }
         
-        // Handle concurrent operations with a user-friendly message
-        if (errorMessage.includes('concurrent_operation')) {
-          throw new Error('Please wait, another NFC operation is in progress');
+        // Also emit the event for other components
+        GlucoseReadingEvents.getInstance().emitNewReading(fullReading);
+        
+        return fullReading;
+      } finally {
+        // Explicitly disable foreground dispatch after reading completes
+        try {
+          console.log('[GlucoseMonitoringService] Disabling NFC foreground dispatch after manual reading...');
+          await nfcCoreService.disableForegroundDispatch();
+        } catch (dispatchError) {
+          console.error('[GlucoseMonitoringService] Error disabling foreground dispatch:', dispatchError);
+          // Continue with other cleanup
+        }
+        
+        // Always clear operation in progress state
+        nfcCoreService.setOperationInProgress(false);
+        
+        // Ensure full cleanup after reading
+        try {
+          await this.nfcService?.cleanup();
+        } catch (cleanupError) {
+          console.error('[GlucoseMonitoringService] Error during NFC cleanup:', cleanupError);
+          // Continue anyway, don't throw from finally
         }
       }
+    } catch (error) {
+      console.error('[GlucoseMonitoringService] Error taking manual reading:', error);
       
-      throw error;
+      // Make sure NFC foreground dispatch is disabled even on error
+      try {
+        const nfcCoreService = NfcService.getInstance();
+        console.log('[GlucoseMonitoringService] Ensuring NFC foreground dispatch is disabled after error...');
+        await nfcCoreService.disableForegroundDispatch();
+        nfcCoreService.setOperationInProgress(false);
+      } catch (dispatchError) {
+        console.error('[GlucoseMonitoringService] Error disabling foreground dispatch after error:', dispatchError);
+      }
+      
+      // Provide more detailed error information
+      if (error instanceof Error) {
+        // Check for specific error messages that need special handling
+        const errorMsg = error.message.toLowerCase();
+        
+        if (errorMsg.includes('timeout') || errorMsg.includes('timed out')) {
+          throw new Error('TIMEOUT: Scan operation timed out. Please try again and keep your device near the sensor.');
+        } else if (errorMsg.includes('tag not found') || errorMsg.includes('no card found')) {
+          throw new Error('TAG_NOT_FOUND: No sensor detected. Please place your sensor directly against your device.');
+        } else if (errorMsg.includes('already active') || errorMsg.includes('already in use')) {
+          throw new Error('SENSOR_ALREADY_ACTIVE: This sensor is already active in the system.');
+        } else if (errorMsg.includes('concurrent') || errorMsg.includes('in progress')) {
+          throw new Error('CONCURRENT_OPERATION: Another NFC operation is already in progress. Please wait and try again.');
+        }
+        
+        // Re-throw the original error if it doesn't match any special cases
+        throw error;
+      }
+      
+      // For unknown errors, throw a generic error
+      throw new Error('Failed to take manual reading due to an unexpected error');
+    } finally {
+      // Make sure NFC foreground dispatch is disabled even on error
+      try {
+        const nfcCoreService = NfcService.getInstance();
+        console.log('[GlucoseMonitoringService] Ensuring NFC foreground dispatch is disabled after error...');
+        await nfcCoreService.disableForegroundDispatch();
+        nfcCoreService.setOperationInProgress(false);
+      } catch (dispatchError) {
+        console.error('[GlucoseMonitoringService] Error disabling foreground dispatch after error:', dispatchError);
+      }
+      
+      // Restore monitoring if it was paused
+      if (wasMonitoring) {
+        console.log('[GlucoseMonitoringService] Restoring continuous monitoring after manual reading');
+        
+        // Wait a moment before restoring monitoring to avoid immediate NFC conflicts
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        // Schedule the next reading
+        this.scheduleNextReading();
+      }
     }
   }
   
@@ -648,5 +845,16 @@ export default class GlucoseMonitoringService {
    */
   public isNfcSupported(): Promise<boolean> {
     return SensorNfcService.isNfcAvailable();
+  }
+  
+  /**
+   * Check if a glucose value is in the alert range
+   */
+  private checkIfAlert(glucoseValue: number): boolean {
+    // Check if value is below or above threshold for alerts
+    const lowThreshold = 70; // mg/dL
+    const highThreshold = 180; // mg/dL
+    
+    return glucoseValue < lowThreshold || glucoseValue > highThreshold;
   }
 } 

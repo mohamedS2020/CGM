@@ -2,7 +2,14 @@ import NfcManager, { NfcTech, NfcEvents } from 'react-native-nfc-manager';
 import { Platform } from 'react-native';
 import NfcService from './NfcService';
 import { GlucoseReading } from './MeasurementService';
-import { ReadingSource } from './GlucoseMonitoringService';
+import { ReadingSource } from './ReadingTypes';
+
+// Extend the GlucoseReading interface to include our source type
+declare module './MeasurementService' {
+  export interface GlucoseReading {
+    source?: ReadingSource;
+  }
+}
 
 export interface LibreSensorInfo {
   serialNumber: string;
@@ -150,6 +157,17 @@ export default class FreeStyleLibreService {
   public async readGlucoseData(): Promise<GlucoseReading> {
     try {
       console.log('[FreeStyleLibreService] Reading glucose data from FreeStyle Libre sensor');
+      console.log('[FreeStyleLibreService] Please position sensor against phone and hold steady...');
+      
+      // Ensure NFC system is properly reset before starting
+      try {
+        console.log('[FreeStyleLibreService] Resetting NFC system before reading...');
+        await this.nfcService.resetNfcSystem();
+        await new Promise(resolve => setTimeout(resolve, 500)); // Wait 500ms for NFC system to stabilize
+      } catch (resetError) {
+        console.warn('[FreeStyleLibreService] Error resetting NFC system:', resetError);
+        // Continue anyway
+      }
       
       // Ensure NFC is not in use
       if (this.nfcService.isOperationInProgress()) {
@@ -157,16 +175,57 @@ export default class FreeStyleLibreService {
         throw new Error('Another NFC operation is in progress');
       }
       
-      this.nfcService.setOperationInProgress(true);
+      // Mark operation as in progress with a longer timeout (60 seconds instead of 30)
+      this.nfcService.setOperationInProgress(true, 60000);
+      
+      // Add a short delay to give UI time to update and user time to position sensor
+      await new Promise(resolve => setTimeout(resolve, 800));
+      
+      let memoryData: Uint8Array | null = null;
+      let retryCount = 0;
+      const maxRetries = 2;
+      
+      // Try reading the memory blocks with retries
+      while (memoryData === null && retryCount <= maxRetries) {
+        try {
+          // Request NfcV technology
+          console.log('[FreeStyleLibreService] Requesting NfcV technology...');
+          console.log('[FreeStyleLibreService] Scanning for sensor - please hold phone steady against sensor...');
+          await NfcManager.requestTechnology(NfcTech.NfcV);
+          
+          // Read memory blocks 0x00 to 0x2F
+          console.log('[FreeStyleLibreService] Reading memory blocks 0x00 to 0x2F');
+          memoryData = await this.readMemoryBlocks(0x00, 0x2F);
+        } catch (error) {
+          console.error(`[FreeStyleLibreService] Error reading glucose data (attempt ${retryCount + 1}/${maxRetries + 1}):`, error);
+          
+          // Clean up NFC resources before retry
+          try {
+            console.log('[FreeStyleLibreService] Cleaning up NFC resources...');
+            await NfcManager.cancelTechnologyRequest().catch(() => {/* ignore errors */});
+          } catch (cleanupError) {
+            console.error('[FreeStyleLibreService] Error cleaning up NFC resources:', cleanupError);
+          }
+          
+          // Reset NFC system if this isn't the last retry
+          if (retryCount < maxRetries) {
+            console.log('[FreeStyleLibreService] Resetting NFC system after error...');
+            await this.nfcService.resetNfcSystem();
+            await new Promise(resolve => setTimeout(resolve, 1000)); // longer wait between retries
+            retryCount++;
+          } else {
+            // If we've exhausted all retries, rethrow the error
+            throw error;
+          }
+        }
+      }
+      
+      // If we still don't have memory data after all retries, throw an error
+      if (!memoryData) {
+        throw new Error('Failed to read sensor data after multiple attempts');
+      }
       
       try {
-        // Request NfcV technology
-        await NfcManager.requestTechnology(NfcTech.NfcV);
-        
-        // Read memory blocks 0x00 to 0x2F
-        console.log('[FreeStyleLibreService] Reading memory blocks 0x00 to 0x2F');
-        const memoryData = await this.readMemoryBlocks(0x00, 0x2F);
-        
         // Extract trend data from block 0x28
         console.log('[FreeStyleLibreService] Extracting trend data from block 0x28');
         const trendBlock = memoryData.slice(
@@ -175,36 +234,63 @@ export default class FreeStyleLibreService {
         );
         const rawGlucose = this.extractRawGlucose(trendBlock);
         
-        // Extract calibration data from blocks 0x2C-0x2E
-        console.log('[FreeStyleLibreService] Extracting calibration data from blocks 0x2C-0x2E');
+        // Read calibration data from blocks
+        console.log('[FreeStyleLibreService] Extracting calibration data');
         const calibrationData = memoryData.slice(
           FreeStyleLibreService.CALIBRATION_BLOCK_START * FreeStyleLibreService.BLOCK_SIZE,
           (FreeStyleLibreService.CALIBRATION_BLOCK_END + 1) * FreeStyleLibreService.BLOCK_SIZE
         );
         const { slope, offset } = this.extractCalibrationParams(calibrationData);
         
-        // Calculate glucose value using calibration formula
-        console.log(`[FreeStyleLibreService] Calculating glucose: ${rawGlucose} * ${slope} + ${offset}`);
-        const glucoseValue = (rawGlucose * slope) + offset;
+        // Apply calibration
+        const calibratedGlucose = Math.max(0, Math.round(rawGlucose * slope + offset));
         
-        // Create glucose reading object
+        // Formulate the reading
         const reading: GlucoseReading = {
-          value: Math.round(glucoseValue),
           timestamp: new Date(),
+          value: calibratedGlucose,
+          isAlert: this.isGlucoseInAlertRange(calibratedGlucose), // Set alert if needed
           source: ReadingSource.LIBRE_SENSOR,
-          isAlert: this.isGlucoseInAlertRange(glucoseValue)
+          _isSensorReading: true
         };
         
-        console.log(`[FreeStyleLibreService] Final glucose value: ${reading.value} mg/dL`);
+        console.log('[FreeStyleLibreService] Successfully read glucose value:', reading.value);
         return reading;
       } finally {
-        // Clean up NFC resources
-        await NfcManager.cancelTechnologyRequest();
+        // Ensure NFC resources are cleaned up
+        try {
+          console.log('[FreeStyleLibreService] Cleaning up NFC resources...');
+          await NfcManager.cancelTechnologyRequest().catch(() => {/* ignore errors */});
+        } catch (cleanupError) {
+          console.error('[FreeStyleLibreService] Error cleaning up NFC resources:', cleanupError);
+        }
+        
+        // Reset operation state
         this.nfcService.setOperationInProgress(false);
       }
     } catch (error) {
+      // If an error happened, try to clean up and reset
+      try {
+        console.log('[FreeStyleLibreService] Cleaning up NFC resources...');
+        await NfcManager.cancelTechnologyRequest().catch(() => {/* ignore errors */});
+      } catch (cleanupError) {
+        // Ignore cleanup errors
+      }
+      
       console.error('[FreeStyleLibreService] Error reading glucose data:', error);
+      
+      // Reset NFC system in case of error
+      try {
+        console.log('[FreeStyleLibreService] Resetting NFC system after error...');
+        await this.nfcService.resetNfcSystem();
+      } catch (resetError) {
+        // Ignore reset errors
+      }
+      
+      // Reset operation state
       this.nfcService.setOperationInProgress(false);
+      
+      // Rethrow the error for the caller to handle
       throw error;
     }
   }
@@ -248,12 +334,17 @@ export default class FreeStyleLibreService {
         for (let i = 0; i < 32; i++) {
           const blockOffset = i * 6; // Each history entry is 6 bytes
           if (blockOffset + 6 <= historyBlocks.length) {
-            const entryData = historyBlocks.slice(blockOffset, blockOffset + 6);
-            const rawValue = this.extractHistoricalGlucose(entryData);
+            // Extract timestamp - 15 minute intervals, with index 0 being the most recent
+            const timestamp = new Date(now.getTime() - (i * 15 * 60 * 1000));
             
-            if (rawValue > 0) {
-              const glucoseValue = (rawValue * slope) + offset;
-              const timestamp = new Date(now.getTime() - (i * 15 * 60 * 1000)); // 15 min intervals
+            // Extract raw glucose value
+            const rawGlucose = this.extractHistoricalGlucose(
+              historyBlocks.slice(blockOffset, blockOffset + 6)
+            );
+            
+            // Calculate actual glucose value
+            if (rawGlucose > 0) { // Skip invalid readings (often 0)
+              const glucoseValue = (rawGlucose * slope) + offset;
               
               readings.push({
                 value: Math.round(glucoseValue),
@@ -265,7 +356,7 @@ export default class FreeStyleLibreService {
           }
         }
         
-        console.log(`[FreeStyleLibreService] Retrieved ${readings.length} historical readings`);
+        console.log(`[FreeStyleLibreService] Extracted ${readings.length} historical readings`);
         return readings;
       } finally {
         // Clean up NFC resources
@@ -286,68 +377,269 @@ export default class FreeStyleLibreService {
     const blockCount = endBlock - startBlock + 1;
     const resultData = new Uint8Array(blockCount * FreeStyleLibreService.BLOCK_SIZE);
     
-    for (let block = startBlock; block <= endBlock; block++) {
+    let failedBlocks = 0;
+    const maxRetries = 3;
+    const maxGlobalRetries = 2; // Retry the entire reading process twice if needed
+    let globalRetryCount = 0;
+    
+    while (globalRetryCount <= maxGlobalRetries) {
       try {
-        const command = [0x02, FreeStyleLibreService.READ_SINGLE_BLOCK, block];
-        const response = await this.sendLibreCommand(command);
+        // If this is a retry, reset the NFC system and re-request the technology
+        if (globalRetryCount > 0) {
+          console.log(`[FreeStyleLibreService] Global retry ${globalRetryCount}/${maxGlobalRetries} - resetting NFC system`);
+          
+          // Make sure existing resources are properly released
+          try {
+            await NfcManager.cancelTechnologyRequest().catch(() => {/* ignore errors */});
+          } catch (cancelError) {
+            console.log('[FreeStyleLibreService] Error cancelling technology request:', cancelError);
+            // Continue anyway
+          }
+          
+          // Give the system time to recover
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          
+          // Reset the NFC system
+          await this.nfcService.resetNfcSystem();
+          await new Promise(resolve => setTimeout(resolve, 1000)); // Wait longer between retries
+          
+          // Re-request the technology
+          try {
+            console.log('[FreeStyleLibreService] Re-requesting NfcV technology...');
+            await NfcManager.requestTechnology(NfcTech.NfcV);
+            console.log('[FreeStyleLibreService] Successfully re-requested NfcV technology');
+            
+            // Additional wait after successful technology request
+            await new Promise(resolve => setTimeout(resolve, 500));
+          } catch (techError) {
+            console.error('[FreeStyleLibreService] Error re-requesting NfcV technology:', techError);
+            // Try once more after a longer delay
+            await new Promise(resolve => setTimeout(resolve, 1500));
+            try {
+              await NfcManager.requestTechnology(NfcTech.NfcV);
+              console.log('[FreeStyleLibreService] Successfully re-requested NfcV technology on second attempt');
+            } catch (secondTechError) {
+              console.error('[FreeStyleLibreService] Failed to re-request NfcV technology on second attempt:', secondTechError);
+              // If we can't get the technology after two attempts, move to the next global retry
+              globalRetryCount++;
+              continue;
+            }
+          }
+        }
         
-        // Make sure response is valid and has expected length
-        if (response && response.length === FreeStyleLibreService.BLOCK_SIZE) {
+        // Reset failed blocks counter for each global retry
+        failedBlocks = 0;
+        
+        // Read each block
+        for (let block = startBlock; block <= endBlock; block++) {
+          let blockData: Uint8Array | null = null;
+          let retryCount = 0;
+          
+          // Try reading this block up to maxRetries times
+          while (retryCount < maxRetries && blockData === null) {
+            try {
+              // Add small delay between reads to give the NFC controller time to recover
+              if (retryCount > 0) {
+                await new Promise(resolve => setTimeout(resolve, 300 + retryCount * 100));
+              }
+              
+              const command = [0x02, FreeStyleLibreService.READ_SINGLE_BLOCK, block];
+              const response = await this.sendLibreCommand(command);
+              
+              // Make sure response is valid and has expected length
+              if (response && response.length === FreeStyleLibreService.BLOCK_SIZE) {
+                blockData = response;
+              } else {
+                console.warn(`[FreeStyleLibreService] Invalid response length for block ${block.toString(16)}: ${response ? response.length : 'null'}`);
+                retryCount++;
+                
+                // Small delay before retry
+                if (retryCount < maxRetries) {
+                  await new Promise(resolve => setTimeout(resolve, 200 * retryCount));
+                }
+              }
+            } catch (error) {
+              console.error(`[FreeStyleLibreService] Error reading block ${block.toString(16)} (attempt ${retryCount+1}/${maxRetries}):`, error);
+              
+              // For specific NFC errors, try to recover
+              if (error instanceof Error) {
+                if (error.message.includes('no tech request available') || 
+                    error.message.includes('no reference available')) {
+                  // Try to re-request the technology
+                  try {
+                    await NfcManager.cancelTechnologyRequest().catch(() => {/* ignore errors */});
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                    await NfcManager.requestTechnology(NfcTech.NfcV);
+                    console.log(`[FreeStyleLibreService] Successfully re-requested technology after error reading block ${block}`);
+                  } catch (reRequestError) {
+                    console.error(`[FreeStyleLibreService] Failed to re-request technology:`, reRequestError);
+                  }
+                }
+              }
+              
+              retryCount++;
+              
+              // Longer delay before retry for communication errors
+              if (retryCount < maxRetries) {
+                await new Promise(resolve => setTimeout(resolve, 300 * retryCount));
+              }
+            }
+          }
+          
           // Calculate offset in the result array
           const offset = (block - startBlock) * FreeStyleLibreService.BLOCK_SIZE;
           
-          // Check if the offset is valid
-          if (offset >= 0 && offset + FreeStyleLibreService.BLOCK_SIZE <= resultData.length) {
-            // Copy response data to our memory array
-            resultData.set(response, offset);
+          // Store block data in result, or increment failed blocks count
+          if (blockData !== null) {
+            // Copy blockData to resultData at the appropriate offset
+            for (let i = 0; i < FreeStyleLibreService.BLOCK_SIZE; i++) {
+              resultData[offset + i] = blockData[i];
+            }
           } else {
-            console.warn(`[FreeStyleLibreService] Invalid offset ${offset} for block ${block}, skipping`);
-            // Fill with zeros for invalid offset
-            const zeroBlock = new Uint8Array(FreeStyleLibreService.BLOCK_SIZE);
-            resultData.set(zeroBlock, (block - startBlock) * FreeStyleLibreService.BLOCK_SIZE);
+            // If we couldn't read this block after all retries, mark it as failed
+            failedBlocks++;
+            
+            // Fill with zeros to maintain array structure
+            for (let i = 0; i < FreeStyleLibreService.BLOCK_SIZE; i++) {
+              resultData[offset + i] = 0;
+            }
+            
+            console.warn(`[FreeStyleLibreService] Failed to read block ${block.toString(16)} after ${maxRetries} attempts`);
           }
-        } else {
-          console.warn(`[FreeStyleLibreService] Invalid response length for block ${block}: ${response ? response.length : 'null'}`);
-          // Fill with zeros for invalid response
-          const zeroBlock = new Uint8Array(FreeStyleLibreService.BLOCK_SIZE);
-          resultData.set(zeroBlock, (block - startBlock) * FreeStyleLibreService.BLOCK_SIZE);
         }
+        
+        // If we've read all blocks with acceptable level of errors, return the data
+        // Allow a small percentage of blocks to fail (e.g., 10%)
+        const failurePercentage = (failedBlocks / blockCount) * 100;
+        if (failurePercentage <= 10) {
+          console.log(`[FreeStyleLibreService] Successfully read ${blockCount - failedBlocks}/${blockCount} blocks (${failurePercentage.toFixed(1)}% failure rate)`);
+          return resultData;
+        }
+        
+        // If too many blocks failed, try again with a global retry
+        console.warn(`[FreeStyleLibreService] Too many blocks failed (${failedBlocks}/${blockCount} = ${failurePercentage.toFixed(1)}%), attempting global retry`);
+        globalRetryCount++;
+        
       } catch (error) {
-        console.error(`[FreeStyleLibreService] Error reading block ${block.toString(16)}:`, error);
+        console.error(`[FreeStyleLibreService] Error during memory block reading (global retry ${globalRetryCount}/${maxGlobalRetries}):`, error);
+        globalRetryCount++;
         
-        // For critical blocks, throw the error to abort the entire read
-        if (block === FreeStyleLibreService.TREND_BLOCK || 
-            (block >= FreeStyleLibreService.CALIBRATION_BLOCK_START && 
-             block <= FreeStyleLibreService.CALIBRATION_BLOCK_END)) {
-          throw new Error(`Failed to read critical block ${block.toString(16)}`);
+        // Make sure to release the NFC technology before trying again
+        try {
+          await NfcManager.cancelTechnologyRequest().catch(e => {/* ignore */});
+        } catch (cleanupError) {
+          // Ignore cleanup errors
         }
-        
-        // For non-critical blocks, fill with zeros and continue
-        const zeroBlock = new Uint8Array(FreeStyleLibreService.BLOCK_SIZE);
-        resultData.set(zeroBlock, (block - startBlock) * FreeStyleLibreService.BLOCK_SIZE);
       }
     }
     
-    return resultData;
+    // If we've exhausted all global retries and still failed
+    console.error(`[FreeStyleLibreService] Failed to read memory blocks after ${maxGlobalRetries+1} attempts`);
+    throw new Error('Failed to read sensor data after multiple attempts');
   }
   
   /**
    * Send a command to the FreeStyle Libre sensor
    */
   private async sendLibreCommand(command: number[]): Promise<Uint8Array> {
-    const tag = await NfcManager.getTag();
+    // Try to get the NFC tag with multiple attempts
+    let tag = null;
+    let tagAttempts = 0;
+    const maxTagAttempts = 3;
+    
+    // Check if NFC technology is properly requested before trying to get tag
+    try {
+      // Verify NFC technology is available before proceeding
+      const techAvailable = await this.verifyNfcTechAvailable();
+      if (!techAvailable) {
+        // Try to reset NFC and request technology again
+        console.log('[FreeStyleLibreService] NFC tech not available, requesting NfcV technology...');
+        try {
+          // Make sure any existing tech request is cancelled
+          await NfcManager.cancelTechnologyRequest().catch(() => {/* ignore errors */});
+          await new Promise(resolve => setTimeout(resolve, 500));
+          await NfcManager.requestTechnology(NfcTech.NfcV);
+          console.log('[FreeStyleLibreService] Successfully requested NfcV technology');
+        } catch (techError) {
+          console.error('[FreeStyleLibreService] Failed to request NfcV technology:', techError);
+          throw new Error('Failed to establish NFC communication - please try again');
+        }
+      }
+    } catch (verifyError) {
+      console.warn('[FreeStyleLibreService] Error verifying NFC tech availability:', verifyError);
+      // Continue and try anyway
+    }
+    
+    while (!tag && tagAttempts < maxTagAttempts) {
+      try {
+        tag = await NfcManager.getTag();
+        if (!tag) {
+          tagAttempts++;
+          
+          // Log the attempt
+          if (tagAttempts < maxTagAttempts) {
+            console.log(`[FreeStyleLibreService] No tag detected, waiting longer (attempt ${tagAttempts}/${maxTagAttempts})...`);
+            // Wait with increasing duration
+            await new Promise(resolve => setTimeout(resolve, 800 + tagAttempts * 400));
+          } else {
+            console.error('[FreeStyleLibreService] Maximum tag detection attempts reached');
+          }
+        }
+      } catch (tagError) {
+        console.error('[FreeStyleLibreService] Error getting NFC tag:', tagError);
+        
+        // Handle specific error types
+        const errorMessage = tagError instanceof Error ? tagError.message : String(tagError);
+        
+        if (errorMessage.includes('no tech request available')) {
+          console.log('[FreeStyleLibreService] No tech request available, trying to re-request technology...');
+          // Try to request technology again
+          try {
+            await NfcManager.cancelTechnologyRequest().catch(() => {/* ignore errors */});
+            await new Promise(resolve => setTimeout(resolve, 500));
+            await NfcManager.requestTechnology(NfcTech.NfcV);
+            console.log('[FreeStyleLibreService] Successfully re-requested NfcV technology after error');
+            // Don't increment attempts for this specific error
+            continue;
+          } catch (reRequestError) {
+            console.error('[FreeStyleLibreService] Failed to re-request NfcV technology:', reRequestError);
+          }
+        } else if (errorMessage.includes('no reference available')) {
+          console.log('[FreeStyleLibreService] No NFC reference available, tag may have been lost');
+          // For this error, wait a bit longer as it often means the tag was present but lost
+          await new Promise(resolve => setTimeout(resolve, 1000 + tagAttempts * 500));
+        }
+        
+        tagAttempts++;
+        // Wait with increasing duration
+        if (tagAttempts < maxTagAttempts) {
+          await new Promise(resolve => setTimeout(resolve, 800 + tagAttempts * 400));
+        }
+      }
+    }
+    
+    // If no tag was found after all attempts
     if (!tag) {
-      throw new Error('No NFC tag found');
+      console.error('[FreeStyleLibreService] No NFC tag found after multiple attempts');
+      throw new Error('No NFC tag found - please ensure the sensor is properly positioned on your phone');
     }
     
     try {
-      // Send command
-      const response = await NfcManager.transceive(command);
+      // Add timeout protection with a longer timeout (8 seconds)
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('TAG_COMMUNICATION_TIMEOUT')), 8000);
+      });
+      
+      console.log(`[FreeStyleLibreService] Sending command to block ${command[2]}`);
+      
+      // Send command with timeout protection
+      const responsePromise = NfcManager.transceive(command);
+      const response = await Promise.race([responsePromise, timeoutPromise]) as number[];
       
       // Ensure response is valid
       if (!response || !Array.isArray(response)) {
-        console.warn('[FreeStyleLibreService] Invalid response from transceive:', response);
-        return new Uint8Array(FreeStyleLibreService.BLOCK_SIZE); // Return zeros
+        console.warn(`[FreeStyleLibreService] Invalid response from transceive for block ${command[2]}:`, response);
+        throw new Error(`Invalid NFC response format for block ${command[2]}`);
       }
       
       // Create a fixed-size buffer
@@ -361,8 +653,45 @@ export default class FreeStyleLibreService {
       
       return resultBuffer;
     } catch (error) {
-      console.error('[FreeStyleLibreService] Error in sendLibreCommand:', error);
+      console.error(`[FreeStyleLibreService] Error in sendLibreCommand for block ${command[2]}:`, error);
+      
+      // Convert timeout errors to a standardized form
+      if (error instanceof Error && error.message === 'TAG_COMMUNICATION_TIMEOUT') {
+        throw new Error(`COMMUNICATION_ERROR: Tag communication timed out for block ${command[2]}`);
+      }
+      
+      // Try to verify if the tag is still connected
+      try {
+        const tagStillPresent = await NfcManager.getTag();
+        if (!tagStillPresent) {
+          throw new Error(`NFC tag connection lost while reading block ${command[2]} - please keep the sensor steady`);
+        }
+      } catch (tagCheckError) {
+        // Ignore errors in tag check
+      }
+      
       throw error;
+    }
+  }
+  
+  /**
+   * Verify if NFC technology is currently available/requested
+   * This helps catch "no tech request available" errors before they happen
+   */
+  private async verifyNfcTechAvailable(): Promise<boolean> {
+    try {
+      // Try a lightweight operation that requires tech request to be active
+      // getTag() is a good choice as it doesn't actually communicate with the tag
+      const tagCheck = await NfcManager.getTag();
+      return true; // If we get here without error, tech is available
+    } catch (error) {
+      if (error instanceof Error && 
+          (error.message.includes('no tech request available') || 
+           error.message.includes('no reference available'))) {
+        return false; // Tech not available
+      }
+      // For other errors, we're not sure, so assume it might be available
+      return true;
     }
   }
   

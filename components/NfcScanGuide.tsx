@@ -1,9 +1,9 @@
 import React, { useEffect, useRef } from 'react';
-import { 
-  View, 
-  Text, 
-  StyleSheet, 
-  Modal, 
+import {
+  View,
+  Text,
+  StyleSheet,
+  Modal,
   Animated, 
   Easing, 
   Dimensions,
@@ -20,11 +20,11 @@ interface NfcScanGuideProps {
   message?: string;
 }
 
-const NfcScanGuide: React.FC<NfcScanGuideProps> = ({
-  visible,
+const NfcScanGuide: React.FC<NfcScanGuideProps> = ({ 
+  visible, 
   onTimeout,
   onCancel,
-  timeoutDuration = 30000, // 30 seconds default
+  timeoutDuration = 20000, // 20 seconds default (increased from 5 seconds)
   message = 'Hold your phone near the sensor'
 }) => {
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -79,13 +79,13 @@ const NfcScanGuide: React.FC<NfcScanGuideProps> = ({
       }
     }
   }, [visible, pulseAnim, moveAnim, onTimeout, timeoutDuration]);
-  
+
   // Compute movement translation for phone
   const translateY = moveAnim.interpolate({
     inputRange: [0, 1],
     outputRange: [0, -40]
   });
-  
+
   return (
     <Modal
       visible={visible}
@@ -145,10 +145,10 @@ const NfcScanGuide: React.FC<NfcScanGuideProps> = ({
             
             <View style={styles.infoItem}>
               <Ionicons name="time-outline" size={20} color="#666" />
-              <Text style={styles.infoText}>This may take a few seconds</Text>
+              <Text style={styles.infoText}>This may take up to 20 seconds</Text>
             </View>
             
-            <View style={styles.infoItem}>
+             <View style={styles.infoItem}>
               <Ionicons name="shield-checkmark-outline" size={20} color="#666" />
               <Text style={styles.infoText}>Remove phone case if scanning fails</Text>
             </View>
