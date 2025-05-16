@@ -11,8 +11,7 @@ import {
   Platform,
   AppState,
   AppStateStatus,
-  Linking,
-  Switch
+  Linking
 } from 'react-native';
 import NetInfo from '@react-native-community/netinfo';
 import { useAuth } from '../../context/AuthContext';
@@ -104,8 +103,7 @@ const HomeScreen = () => {
   const [loading, setLoading] = useState(true);
   const [chartTimeframe, setChartTimeframe] = useState<'hour' | 'day' | 'week'>('day');
   const [scanning, setScanning] = useState(false);
-  const [monitoring, setMonitoring] = useState(false);
-  const [monitoringInterval, setMonitoringInterval] = useState(5 * 60 * 1000); // 5 minutes default
+  const [monitoringInterval, setMonitoringInterval] = useState(5 * 60 * 1000); // Keep for manual reading
   const [nfcSupported, setNfcSupported] = useState<boolean | null>(null);
   const [nfcEnabled, setNfcEnabled] = useState<boolean | null>(null);
   
@@ -444,18 +442,8 @@ const HomeScreen = () => {
       // Try to take a manual reading using the monitoring service
       if (user) {
         try {
-          // Set the user ID if monitoring is not active yet
-          if (!monitoringService.isMonitoring()) {
-            monitoringService.startMonitoring(
-              user.uid, 
-              monitoringInterval,
-              handleNewReading,
-              handleMonitoringError
-            );
-            // We don't set monitoring state here because we're just taking a manual reading
-          }
-          
-          // Take a manual reading
+          // Take a manual reading without setting up continuous monitoring
+          monitoringService.stopMonitoring(); // Make sure any existing monitoring is stopped
           const reading = await monitoringService.takeManualReading(user.uid);
           
           // Directly update state with new reading for immediate UI update
@@ -560,139 +548,6 @@ const HomeScreen = () => {
     }
   };
 
-  // Toggle monitoring status
-  const handleMonitoringToggle = async () => {
-    try {
-      if (!monitoring) {
-        // Check NFC availability first
-        const nfcAvailable = await SensorNfcService.isNfcAvailable();
-        if (!nfcAvailable) {
-          Alert.alert(
-            "NFC Not Available",
-            "This device does not support NFC or NFC is disabled. Please enable NFC in your device settings to use continuous glucose monitoring.",
-            [{ text: "OK" }]
-          );
-          return;
-        }
-        
-        // Start monitoring
-        startMonitoring();
-      } else {
-        // Stop monitoring
-        stopMonitoring();
-      }
-    } catch (error) {
-      console.error('Error toggling monitoring:', error);
-      Alert.alert(
-        "Error",
-        "An error occurred while toggling glucose monitoring. Please try again.",
-        [{ text: "OK" }]
-      );
-    }
-  };
-  
-  // Start continuous monitoring
-  const startMonitoring = async () => {
-    try {
-      // Check if user exists
-      if (!user) {
-        Alert.alert("Error", "User not authenticated. Please sign in to start monitoring.");
-        return;
-      }
-      
-      // Start the monitoring service
-      const result = await monitoringService.startMonitoring(
-        user.uid, 
-        monitoringInterval, // use the selected interval from state
-        (reading) => {
-          // Handle new reading
-          console.log('New glucose reading:', reading);
-          handleNewReading(reading);
-        },
-        (error) => {
-          // Handle errors
-          console.error('Monitoring error:', error);
-          if (error.message === 'NFC_NOT_AVAILABLE') {
-            Alert.alert(
-              "NFC Not Available",
-              "NFC is required for glucose monitoring but is not available on this device or is disabled.",
-              [{ text: "OK" }]
-            );
-            setMonitoring(false);
-          } else if (error.message === 'NFC_NOT_ENABLED') {
-            Alert.alert(
-              "NFC Not Enabled",
-              "Please enable NFC in your device settings to continue glucose monitoring.",
-              [{ text: "OK" }]
-            );
-            setMonitoring(false);
-          } else if (error.message === 'SENSOR_NOT_FOUND') {
-            Alert.alert(
-              "Sensor Not Found",
-              "Could not detect a glucose sensor. Please ensure your sensor is properly applied and try again.",
-              [{ text: "OK" }]
-            );
-            setMonitoring(false);
-          }
-        }
-      );
-      
-      if (result === true) {
-        setMonitoring(true);
-        Alert.alert("Monitoring Started", "Continuous glucose monitoring has been activated.");
-      } else if (result === 'SENSOR_NOT_FOUND') {
-        Alert.alert(
-          "Sensor Not Found", 
-          "Could not detect a glucose sensor. Please ensure your sensor is properly applied and try again."
-        );
-      } else if (result === 'ALREADY_MONITORING') {
-        Alert.alert("Monitoring Active", "Continuous glucose monitoring is already active.");
-        setMonitoring(true); // Make sure UI reflects actual state
-      } else {
-        // Fix the error message formatting to avoid showing {object Object}
-        const errorMessage = typeof result === 'string' ? result : 'Unknown error';
-        Alert.alert("Monitoring Error", `Could not start glucose monitoring. ${errorMessage}`);
-      }
-    } catch (error) {
-      console.error('Error starting monitoring:', error);
-      Alert.alert(
-        "Error",
-        "An error occurred while starting glucose monitoring. Please try again.",
-        [{ text: "OK" }]
-      );
-    }
-  };
-
-  // Stop continuous monitoring
-  const stopMonitoring = () => {
-    try {
-      monitoringService.stopMonitoring();
-      setMonitoring(false);
-      Alert.alert("Monitoring Stopped", "Continuous glucose monitoring has been deactivated.");
-    } catch (error) {
-      console.error('Error stopping monitoring:', error);
-      Alert.alert(
-        "Error",
-        "An error occurred while stopping glucose monitoring. Please try again.",
-        [{ text: "OK" }]
-      );
-    }
-  };
-  
-  // Change monitoring interval
-  const changeMonitoringInterval = (minutes: number) => {
-    const intervalMs = minutes * 60 * 1000;
-    setMonitoringInterval(intervalMs);
-    
-    if (monitoringService.isMonitoring()) {
-      monitoringService.setMonitoringInterval(intervalMs);
-      Alert.alert(
-        'Interval Updated',
-        `Monitoring interval has been updated to ${minutes} minutes.`
-      );
-    }
-  };
-  
   // Handle new reading from monitoring service
   const handleNewReading = (reading: GlucoseReading) => {
     console.log('New reading received:', reading);
@@ -708,15 +563,6 @@ const HomeScreen = () => {
   const handleMonitoringError = (error: Error) => {
     console.error('[HomeScreen] Monitoring error:', error);
     
-    // Check if monitoring is still active
-    const isActive = monitoringService.isMonitoring();
-    if (!isActive) {
-      setMonitoring(false);
-    }
-    
-    // Only show alerts if monitoring is active or if explicitly doing a manual scan
-    const shouldShowAlert = isActive || scanning;
-    
     // Provide user-friendly feedback for common errors
     if (error.message.includes('TAG_NOT_FOUND')) {
       // This is expected when no sensor is connected - don't show an alert
@@ -724,36 +570,12 @@ const HomeScreen = () => {
     } else if (error.message.includes('USER_CANCELLED')) {
       // User cancelled the scan, no need to show an alert
       console.log('[HomeScreen] Sensor scan was cancelled by the user');
-    } else if (error.message.includes('SENSOR_TIMEOUT')) {
-      // Timeout during sensor detection
-      console.log('[HomeScreen] Sensor scan timed out - no sensor found within timeout period');
-      if (shouldShowAlert) {
-        Alert.alert(
-          'Scan Timeout',
-          'Could not detect a sensor within the time limit. Please make sure your sensor is properly positioned.',
-          [{ text: 'OK' }]
-        );
-      }
-    } else if (error.message.includes('COMMUNICATION_ERROR')) {
-      // Only show an alert for communication errors if monitoring is active
-      if (shouldShowAlert) {
-        Alert.alert(
-          'Communication Error',
-          'Unable to read from sensor. Please make sure your sensor is properly positioned.',
-          [{ text: 'OK' }]
-        );
-      }
-    } else if (error.message.includes('CANCELLED')) {
-      // User cancelled the scan, no need to show an alert
-      console.log('[HomeScreen] Sensor scan was cancelled by the user');
     } else if (error.message.includes('CONCURRENT_OPERATION') || error.message.includes('in progress')) {
       // For concurrent operation errors, delay the alert to see if it resolves itself quickly
       // This prevents flashing alerts that disappear immediately
-      if (shouldShowAlert) {
+      if (scanning) {
         // Create a delay before showing the alert
         const delayTimer = setTimeout(() => {
-          // Check if monitoring is still active after delay
-          const stillActive = monitoringService.isMonitoring();
           // Only show the alert if we're still in the scanning state
           if (scanning) {
             Alert.alert(
@@ -779,8 +601,8 @@ const HomeScreen = () => {
         // Clear the timer if scanning state changes
         return () => clearTimeout(delayTimer);
       }
-    } else if (shouldShowAlert) {
-      // For other errors, only alert if monitoring is active
+    } else {
+      // For other errors
       Alert.alert(
         'Reading Error',
         'There was a problem reading your glucose sensor. Please try again.',
@@ -1057,10 +879,6 @@ const HomeScreen = () => {
 
   // Update monitoring state when app becomes active
   useEffect(() => {
-    const checkMonitoringStatus = () => {
-      setMonitoring(monitoringService.isMonitoring());
-    };
-    
     // App state tracking
     let lastAppStateChange = Date.now();
     const MIN_SYNC_INTERVAL = 10000; // 10 seconds between app foreground syncs
@@ -1068,9 +886,6 @@ const HomeScreen = () => {
     // Add app state change listener
     const appStateSubscription = AppState.addEventListener('change', (nextAppState) => {
       if (appStateRef.current !== 'active' && nextAppState === 'active') {
-        // Check monitoring status
-        checkMonitoringStatus();
-        
         // Re-check NFC availability when returning to the app
         // This helps detect if NFC was enabled in settings
         SensorNfcService.isNfcAvailable()
@@ -1116,18 +931,36 @@ const HomeScreen = () => {
         }
       }
       
-      // Update app state reference
+      // Update app state ref
       appStateRef.current = nextAppState;
-      
-      // Track time of this state change
-      if (nextAppState === 'active' || nextAppState === 'background') {
-        lastAppStateChange = Date.now();
-      }
+      lastAppStateChange = Date.now();
     });
     
     return () => {
-      if (appStateSubscription && typeof appStateSubscription.remove === 'function') {
-        appStateSubscription.remove();
+      appStateSubscription.remove();
+      // Clean up resources
+      if (monitoringService.isMonitoring()) {
+        monitoringService.stopMonitoring();
+      }
+      
+      // Safely clean up NFC - first use the core service
+      const nfcCoreService = NfcService.getInstance();
+      if (nfcCoreService) {
+        try {
+          nfcCoreService.forceCancelTechnologyRequest();
+          nfcCoreService.setOperationInProgress(false);
+        } catch (error) {
+          console.error('Error cleaning up core NFC service:', error);
+        }
+      }
+      
+      // Then clean up the sensor-specific service
+      if (nfcService && typeof nfcService.cleanup === 'function') {
+        try {
+          nfcService.cleanup();
+        } catch (error) {
+          console.error('Error cleaning up NFC service:', error);
+        }
       }
     };
   }, [user]);
@@ -1241,73 +1074,6 @@ const HomeScreen = () => {
       }
     };
   }, []);
-
-  // Render monitoring controls
-  const renderMonitoringControls = () => {
-    // Store the interval options
-    const intervalOptions = [
-      { label: '5 min', value: 5 * 60 * 1000 },
-      { label: '10 min', value: 10 * 60 * 1000 },
-      { label: '15 min', value: 15 * 60 * 1000 },
-      { label: '30 min', value: 30 * 60 * 1000 },
-    ];
-
-    // Check if NFC is available for monitoring
-    const isNfcAvailable = nfcSupported === true && nfcEnabled === true;
-    const monitoringDisabled = !isNfcAvailable || scanning;
-
-    return (
-      <View style={styles.monitoringContainer}>
-        <View style={styles.monitoringHeader}>
-          <Text style={styles.monitoringTitle}>Continuous Monitoring</Text>
-          <Switch
-            trackColor={{ false: '#767577', true: '#81b0ff' }}
-            thumbColor={monitoring ? '#2F80ED' : '#f4f3f4'}
-            ios_backgroundColor="#3e3e3e"
-            onValueChange={handleMonitoringToggle}
-            value={monitoring}
-            disabled={monitoringDisabled}
-          />
-        </View>
-        
-        {!isNfcAvailable && (
-          <View style={styles.warningContainer}>
-            <Text style={styles.warningText}>
-              {nfcSupported === false 
-                ? 'Continuous monitoring requires NFC, which is not supported on this device.' 
-                : 'Please enable NFC to use continuous monitoring.'}
-            </Text>
-          </View>
-        )}
-
-        <Text style={styles.monitoringLabel}>Scan Interval:</Text>
-        <View style={styles.intervalButtons}>
-          {intervalOptions.map((option) => (
-            <TouchableOpacity
-              key={option.value}
-              style={[
-                styles.intervalButton,
-                monitoringInterval === option.value && styles.intervalButtonActive,
-                monitoringDisabled && styles.buttonDisabled
-              ]}
-              onPress={() => setMonitoringInterval(option.value)}
-              disabled={monitoringDisabled}
-            >
-              <Text
-                style={[
-                  styles.intervalButtonText,
-                  monitoringInterval === option.value && styles.intervalButtonTextActive,
-                  monitoringDisabled && styles.buttonTextDisabled
-                ]}
-              >
-                {option.label}
-              </Text>
-            </TouchableOpacity>
-          ))}
-        </View>
-      </View>
-    );
-  };
 
   // Render NFC status indicator
   const renderNfcStatus = () => {
@@ -1524,9 +1290,6 @@ const HomeScreen = () => {
       {/* NFC Scan Button */}
       {renderScanButton()}
       
-      {/* Continuous Monitoring Controls */}
-      {renderMonitoringControls()}
-      
       {/* NFC Status Indicator */}
       {renderNfcStatus()}
     </ScrollView>
@@ -1719,62 +1482,6 @@ const styles = StyleSheet.create({
     shadowRadius: 4,
     elevation: 3,
   },
-  monitoringHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 10,
-  },
-  monitoringTitle: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    color: '#333',
-  },
-  monitoringLabel: {
-    fontSize: 14,
-    color: '#666',
-    marginBottom: 10,
-  },
-  intervalButtons: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  intervalButton: {
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 6,
-    backgroundColor: '#eee',
-    marginHorizontal: 2,
-  },
-  intervalButtonActive: {
-    backgroundColor: '#4361EE',
-  },
-  intervalButtonText: {
-    fontSize: 12,
-    color: '#666',
-  },
-  intervalButtonTextActive: {
-    color: 'white',
-  },
-  warningContainer: {
-    backgroundColor: '#fff3cd',
-    borderColor: '#ffeeba',
-    borderWidth: 1,
-    borderRadius: 4,
-    padding: 10,
-    marginVertical: 10,
-  },
-  warningText: {
-    color: '#856404',
-    fontSize: 14,
-  },
-  buttonDisabled: {
-    opacity: 0.5,
-    backgroundColor: '#f0f0f0',
-  },
-  buttonTextDisabled: {
-    color: '#999',
-  },
   nfcStatusContainer: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1782,6 +1489,8 @@ const styles = StyleSheet.create({
     padding: 10,
     borderRadius: 6,
     marginBottom: 15,
+    marginHorizontal: 15,
+    marginTop: 10,
   },
   nfcStatusIndicator: {
     width: 12,
