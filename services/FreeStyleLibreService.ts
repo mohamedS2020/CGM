@@ -226,13 +226,24 @@ export default class FreeStyleLibreService {
       }
       
       try {
+        // Log the raw bytes from key memory blocks
+        console.log('[FreeStyleLibreService] Raw data from block 0x27:', this.bytesToHex(memoryData.slice(0x27 * 8, 0x28 * 8)));
+        console.log('[FreeStyleLibreService] Raw data from block 0x28:', this.bytesToHex(memoryData.slice(0x28 * 8, 0x29 * 8)));
+        console.log('[FreeStyleLibreService] Raw data from block 0x29:', this.bytesToHex(memoryData.slice(0x29 * 8, 0x2A * 8)));
+        
         // Extract trend data from block 0x28
         console.log('[FreeStyleLibreService] Extracting trend data from block 0x28');
         const trendBlock = memoryData.slice(
           FreeStyleLibreService.TREND_BLOCK * FreeStyleLibreService.BLOCK_SIZE, 
           (FreeStyleLibreService.TREND_BLOCK + 1) * FreeStyleLibreService.BLOCK_SIZE
         );
+        
+        // Log the specific bytes used for current glucose calculation
+        console.log('[FreeStyleLibreService] Current glucose bytes:', this.bytesToHex(trendBlock.slice(0, 2)));
+        
+        // Extract raw glucose value
         const rawGlucose = this.extractRawGlucose(trendBlock);
+        console.log('[FreeStyleLibreService] Raw uncalibrated glucose value:', rawGlucose);
         
         // Read calibration data from blocks
         console.log('[FreeStyleLibreService] Extracting calibration data');
@@ -240,10 +251,33 @@ export default class FreeStyleLibreService {
           FreeStyleLibreService.CALIBRATION_BLOCK_START * FreeStyleLibreService.BLOCK_SIZE,
           (FreeStyleLibreService.CALIBRATION_BLOCK_END + 1) * FreeStyleLibreService.BLOCK_SIZE
         );
-        const { slope, offset } = this.extractCalibrationParams(calibrationData);
         
-        // Apply calibration
-        const calibratedGlucose = Math.max(0, Math.round(rawGlucose * slope + offset));
+        // Log raw calibration data
+        console.log('[FreeStyleLibreService] Raw calibration data:', this.bytesToHex(calibrationData));
+        
+        // Extract calibration parameters
+        const { slope, offset } = this.extractCalibrationParams(calibrationData);
+        console.log('[FreeStyleLibreService] Calibration parameters:', JSON.stringify({ slope, offset }));
+        
+        // Log intermediate calculation steps
+        const slopeAdjustment = rawGlucose * slope;
+        console.log('[FreeStyleLibreService] After applying slope:', slopeAdjustment);
+        
+        const offsetAdjustment = slopeAdjustment + offset;
+        console.log('[FreeStyleLibreService] After applying offset:', offsetAdjustment);
+        
+        // Apply calibration and round to nearest integer
+        const calibratedGlucose = Math.max(0, Math.round(offsetAdjustment));
+        console.log('[FreeStyleLibreService] Final calibrated glucose value:', calibratedGlucose);
+        
+        // Check if value is extremely high and potentially should be capped
+        if (calibratedGlucose > 500) {
+          console.log('[FreeStyleLibreService] WARNING: Value exceeds 500 mg/dL (official app limit)');
+          console.log('[FreeStyleLibreService] FreeStyle app would likely display this as 500+ mg/dL');
+          // Uncomment to implement capping
+          // const cappedValue = 500;
+          // console.log('[FreeStyleLibreService] Value capped to 500 mg/dL');
+        }
         
         // Formulate the reading
         const reading: GlucoseReading = {
@@ -315,43 +349,68 @@ export default class FreeStyleLibreService {
         await NfcManager.requestTechnology(NfcTech.NfcV);
         
         // Read memory blocks containing historical data
+        console.log('[FreeStyleLibreService] Reading memory blocks for historical data');
         const memoryData = await this.readMemoryBlocks(0x00, 0x2F);
         
+        // Log raw data from key memory blocks
+        console.log('[FreeStyleLibreService] Raw historical block data (first few blocks):');
+        for (let i = 0x16; i < 0x1A; i++) {
+          console.log(`[FreeStyleLibreService] Block 0x${i.toString(16).padStart(2, '0')}:`, 
+            this.bytesToHex(memoryData.slice(i * FreeStyleLibreService.BLOCK_SIZE, (i+1) * FreeStyleLibreService.BLOCK_SIZE)));
+        }
+        
         // Extract calibration data for glucose calculation
+        console.log('[FreeStyleLibreService] Extracting calibration data for historical readings');
         const calibrationData = memoryData.slice(
           FreeStyleLibreService.CALIBRATION_BLOCK_START * FreeStyleLibreService.BLOCK_SIZE,
           (FreeStyleLibreService.CALIBRATION_BLOCK_END + 1) * FreeStyleLibreService.BLOCK_SIZE
         );
+        console.log('[FreeStyleLibreService] Calibration block data:', this.bytesToHex(calibrationData));
+        
         const { slope, offset } = this.extractCalibrationParams(calibrationData);
+        console.log('[FreeStyleLibreService] Extracted calibration parameters:', { slope, offset });
         
         // Extract historical data (blocks vary depending on sensor version)
         // This is a simplified implementation
+        console.log('[FreeStyleLibreService] Processing historical data blocks');
         const historyBlocks = memoryData.slice(0x16 * FreeStyleLibreService.BLOCK_SIZE);
         const readings: GlucoseReading[] = [];
         
         // Parse historical entries
         const now = new Date();
+        console.log('[FreeStyleLibreService] Parsing historical entries (up to 32 entries)');
         for (let i = 0; i < 32; i++) {
           const blockOffset = i * 6; // Each history entry is 6 bytes
           if (blockOffset + 6 <= historyBlocks.length) {
             // Extract timestamp - 15 minute intervals, with index 0 being the most recent
             const timestamp = new Date(now.getTime() - (i * 15 * 60 * 1000));
+            console.log(`[FreeStyleLibreService] Historical entry ${i} timestamp:`, timestamp);
+            
+            // Extract history data segment
+            const historySegment = historyBlocks.slice(blockOffset, blockOffset + 6);
+            console.log(`[FreeStyleLibreService] Historical entry ${i} raw data:`, this.bytesToHex(historySegment));
             
             // Extract raw glucose value
-            const rawGlucose = this.extractHistoricalGlucose(
-              historyBlocks.slice(blockOffset, blockOffset + 6)
-            );
+            const rawGlucose = this.extractHistoricalGlucose(historySegment);
+            console.log(`[FreeStyleLibreService] Historical entry ${i} raw glucose:`, rawGlucose);
             
             // Calculate actual glucose value
             if (rawGlucose > 0) { // Skip invalid readings (often 0)
               const glucoseValue = (rawGlucose * slope) + offset;
+              console.log(`[FreeStyleLibreService] Historical entry ${i} calculated glucose (raw*slope+offset):`, 
+                `${rawGlucose} * ${slope} + ${offset} = ${glucoseValue}`);
+              
+              const roundedValue = Math.round(glucoseValue);
+              console.log(`[FreeStyleLibreService] Historical entry ${i} rounded glucose:`, roundedValue);
               
               readings.push({
-                value: Math.round(glucoseValue),
+                value: roundedValue,
                 timestamp,
                 source: ReadingSource.LIBRE_SENSOR,
                 isAlert: this.isGlucoseInAlertRange(glucoseValue)
               });
+            } else {
+              console.log(`[FreeStyleLibreService] Historical entry ${i} skipped (invalid raw value:`, rawGlucose, ')');
             }
           }
         }
@@ -699,9 +758,24 @@ export default class FreeStyleLibreService {
    * Extract raw glucose value from trend data block
    */
   private extractRawGlucose(trendBlock: Uint8Array): number {
-    // Implementation to extract the raw glucose value from block 0x28
-    // This is based on the FreeStyle Libre format
-    const rawValue = (trendBlock[0] | (trendBlock[1] << 8)) & 0x3FFF;
+    // Log detailed extraction process
+    console.log('[FreeStyleLibreService] Raw trend block bytes:', this.bytesToHex(trendBlock));
+    
+    // The current glucose bytes are the first two bytes of the trend block
+    const byte0 = trendBlock[0];
+    const byte1 = trendBlock[1];
+    
+    console.log('[FreeStyleLibreService] Current glucose byte0 (LSB):', byte0.toString(16).padStart(2, '0'));
+    console.log('[FreeStyleLibreService] Current glucose byte1 (MSB):', byte1.toString(16).padStart(2, '0'));
+    
+    // Combine the bytes to form a 16-bit value
+    const combined = byte0 | (byte1 << 8);
+    console.log('[FreeStyleLibreService] Combined 16-bit value:', combined.toString(16).padStart(4, '0'));
+    
+    // Apply bitmask 0x3FFF (14 bits) to get the raw glucose value
+    const rawValue = combined & 0x3FFF;
+    console.log('[FreeStyleLibreService] After applying bitmask 0x3FFF:', rawValue);
+    
     return rawValue;
   }
   
@@ -709,8 +783,24 @@ export default class FreeStyleLibreService {
    * Extract historical glucose value
    */
   private extractHistoricalGlucose(historyData: Uint8Array): number {
-    // Implementation to extract historical glucose value
-    const rawValue = (historyData[0] | (historyData[1] << 8)) & 0x3FFF;
+    // Log detailed extraction process
+    console.log('[FreeStyleLibreService] Raw history data bytes:', this.bytesToHex(historyData));
+    
+    // The historical glucose bytes are the first two bytes of the history data
+    const byte0 = historyData[0];
+    const byte1 = historyData[1];
+    
+    console.log('[FreeStyleLibreService] Historical glucose byte0 (LSB):', byte0.toString(16).padStart(2, '0'));
+    console.log('[FreeStyleLibreService] Historical glucose byte1 (MSB):', byte1.toString(16).padStart(2, '0'));
+    
+    // Combine the bytes to form a 16-bit value
+    const combined = byte0 | (byte1 << 8);
+    console.log('[FreeStyleLibreService] Combined 16-bit value:', combined.toString(16).padStart(4, '0'));
+    
+    // Apply bitmask 0x3FFF (14 bits) to get the raw glucose value
+    const rawValue = combined & 0x3FFF;
+    console.log('[FreeStyleLibreService] After applying bitmask 0x3FFF:', rawValue);
+    
     return rawValue;
   }
   
@@ -722,11 +812,21 @@ export default class FreeStyleLibreService {
     // Based on reverse-engineered FreeStyle Libre sensor format
     
     try {
+      // Log raw calibration block data
+      console.log('[FreeStyleLibreService] Calibration block bytes:', this.bytesToHex(calibrationData));
+      
       // Extract raw calibration values
       const i1 = ((calibrationData[3] & 0x0F) << 8) | calibrationData[2];
       const i2 = ((calibrationData[3] & 0xF0) << 4) | calibrationData[4];
       const i3 = ((calibrationData[5] & 0x0F) << 8) | calibrationData[6];
       const i4 = ((calibrationData[5] & 0xF0) << 4) | calibrationData[7];
+      
+      // Log raw extracted parameters
+      console.log('[FreeStyleLibreService] Raw calibration parameters:', { i1, i2, i3, i4 });
+      console.log('[FreeStyleLibreService] i1 bytes:', 
+          this.bytesToHex(new Uint8Array([calibrationData[2], calibrationData[3] & 0x0F])));
+      console.log('[FreeStyleLibreService] i2 bytes:', 
+          this.bytesToHex(new Uint8Array([calibrationData[4], (calibrationData[3] & 0xF0) >> 4])));
       
       // Calculate sensor-specific parameters
       const sensorParameters = {
@@ -739,9 +839,12 @@ export default class FreeStyleLibreService {
       // Calculate slope and offset using calibration formula
       // These values are approximated based on common Libre sensor behavior
       const slope = 0.1 + (sensorParameters.i1 * 0.0001);
-      const offset = -0.5 + (sensorParameters.i2 * 0.01);
+      console.log('[FreeStyleLibreService] Calculated slope:', slope, '(0.1 + i1*0.0001)');
       
-      console.log(`[FreeStyleLibreService] Calculated calibration: slope=${slope}, offset=${offset}`);
+      const offset = -0.5 + (sensorParameters.i2 * 0.01);
+      console.log('[FreeStyleLibreService] Calculated offset:', offset, '(-0.5 + i2*0.01)');
+      
+      console.log(`[FreeStyleLibreService] Final calibration: slope=${slope}, offset=${offset}`);
       return { slope, offset };
     } catch (error) {
       console.warn('[FreeStyleLibreService] Error extracting calibration, using defaults:', error);
@@ -821,5 +924,12 @@ export default class FreeStyleLibreService {
     const GLUCOSE_HIGH = 180;
     
     return glucoseValue < GLUCOSE_LOW || glucoseValue > GLUCOSE_HIGH;
+  }
+  
+  /**
+   * Helper function to convert byte arrays to hex strings for logging
+   */
+  private bytesToHex(bytes: Uint8Array): string {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(' ');
   }
 } 

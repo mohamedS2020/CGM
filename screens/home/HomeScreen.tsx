@@ -547,7 +547,7 @@ const HomeScreen = () => {
       await ensureNfcCleanup();
     }
   };
-
+  
   // Handle new reading from monitoring service
   const handleNewReading = (reading: GlucoseReading) => {
     console.log('New reading received:', reading);
@@ -933,11 +933,11 @@ const HomeScreen = () => {
       
       // Update app state ref
       appStateRef.current = nextAppState;
-      lastAppStateChange = Date.now();
+        lastAppStateChange = Date.now();
     });
     
     return () => {
-      appStateSubscription.remove();
+        appStateSubscription.remove();
       // Clean up resources
       if (monitoringService.isMonitoring()) {
         monitoringService.stopMonitoring();
