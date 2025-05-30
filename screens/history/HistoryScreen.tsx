@@ -467,7 +467,6 @@ const styles = StyleSheet.create({
     marginTop: 10,
   },
   listContent: {
-    paddingHorizontal: 16,
     paddingBottom: 120,
   },
   dateSection: {
